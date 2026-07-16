@@ -2,7 +2,7 @@ import AppKit
 
 @MainActor
 final class MirrorWindowController: NSWindowController, NSWindowDelegate {
-  private static let defaultContentSize = NSSize(width: 560, height: 820)
+  private static let defaultContentSize = NSSize(width: 453, height: 1014)
   // Reveal/hide are decided from the pointer's position relative to the mirror's
   // top edge, which never moves (the window grows *above* it). Reveal only right
   // at the edge; keep shown across a much wider band so the growing/collapsing
