@@ -109,6 +109,14 @@ MIRRORPHONE_NOTARY_PROFILE="YOUR_NOTARYTOOL_PROFILE" \
 
 Set `MIRRORPHONE_SIGNING_IDENTITY` if more than one Developer ID Application certificate is installed. The finished disk image is written to `dist/`.
 
+To build the disk image and upload it with a SHA-256 checksum to a draft GitHub Release, run:
+
+```sh
+./release.sh 1.0.0
+```
+
+The release script requires a clean branch that exactly matches its remote upstream and an authenticated GitHub CLI. Select the Developer ID team and the `notarytool` Keychain profile with `MIRRORPHONE_TEAM_ID` and `MIRRORPHONE_NOTARY_PROFILE`; the script does not accept or store signing credentials. Review the draft release before publishing it.
+
 ## Contributing
 
 Bug reports and pull requests are welcome. Please include the macOS version, device model, mobile OS version, and relevant build or runtime output when reporting device-specific problems.

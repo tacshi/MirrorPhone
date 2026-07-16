@@ -19,8 +19,8 @@ APP_BUNDLE="$ROOT/$APP_NAME.app"
 INFO_PLIST="$ROOT/Resources/Info.plist"
 ICON_FILE="$ROOT/Resources/MirrorPhone.icns"
 DMG_BACKGROUND="$ROOT/Resources/DMGBackground.png"
-TEAM_ID="${MIRRORPHONE_TEAM_ID:-X5X4TD477G}"
-NOTARY_PROFILE="${MIRRORPHONE_NOTARY_PROFILE:-MirrorPhone}"
+TEAM_ID="${MIRRORPHONE_TEAM_ID:-}"
+NOTARY_PROFILE="${MIRRORPHONE_NOTARY_PROFILE:-}"
 SIGNING_IDENTITY="${MIRRORPHONE_SIGNING_IDENTITY:-}"
 SKIP_NOTARIZATION="${MIRRORPHONE_SKIP_NOTARIZATION:-0}"
 VOLUME_NAME="$APP_NAME Installer"
@@ -57,15 +57,21 @@ if pgrep -f -x "$APP_BUNDLE/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
 fi
 
 if [[ -z "$SIGNING_IDENTITY" ]]; then
+  [[ -n "$TEAM_ID" ]] || fail \
+    "MIRRORPHONE_TEAM_ID is required when MIRRORPHONE_SIGNING_IDENTITY is not set"
   SIGNING_IDENTITY="$({ security find-identity -v -p codesigning 2>/dev/null || true; } \
     | sed -n "s/.*\"\(Developer ID Application:.*($TEAM_ID)\)\".*/\1/p" \
     | head -n 1)"
 fi
 
 [[ -n "$SIGNING_IDENTITY" ]] || fail \
-  "no Developer ID Application identity for team $TEAM_ID was found in Keychain"
+  "no Developer ID Application identity for the configured team was found in Keychain"
 [[ "$SIGNING_IDENTITY" != "-" ]] || fail \
   "release bundles require a Developer ID Application identity, not an ad-hoc signature"
+if [[ "$SKIP_NOTARIZATION" != "1" ]]; then
+  [[ -n "$NOTARY_PROFILE" ]] || fail \
+    "MIRRORPHONE_NOTARY_PROFILE is required unless notarization is skipped"
+fi
 
 FINAL_DMG="$DIST_DIR/$APP_NAME-$VERSION.dmg"
 
@@ -244,7 +250,7 @@ codesign --verify --verbose=2 "$FINAL_DMG"
 if [[ "$SKIP_NOTARIZATION" == "1" ]]; then
   print -- "Skipping notarization because MIRRORPHONE_SKIP_NOTARIZATION=1."
 else
-  print -- "Submitting to Apple notary service with profile $NOTARY_PROFILE..."
+  print -- "Submitting to Apple notary service..."
   xcrun notarytool submit \
     "$FINAL_DMG" \
     --keychain-profile "$NOTARY_PROFILE" \
