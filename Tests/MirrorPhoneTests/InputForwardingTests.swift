@@ -82,6 +82,87 @@ struct DevicePointTests {
   }
 }
 
+@Suite("Platform-neutral device input")
+struct DeviceInputEventTests {
+  @Test("Touch locations round-trip through normalized coordinates")
+  func normalizedTouchRoundTrip() throws {
+    let frame = CGSize(width: 1080, height: 2340)
+    let point = CGPoint(x: 721, y: 1804)
+    let touch = try #require(
+      DeviceTouchEvent(phase: .move, point: point, referenceSize: frame)
+    )
+
+    #expect(touch.phase == .move)
+    #expect(touch.location.point(in: frame) == point)
+  }
+
+  @Test("Normalized touch locations clamp to the reference surface")
+  func normalizedTouchClamps() throws {
+    let frame = CGSize(width: 100, height: 200)
+    let touch = try #require(
+      DeviceTouchEvent(
+        phase: .down,
+        point: CGPoint(x: -20, y: 250),
+        referenceSize: frame
+      )
+    )
+
+    #expect(touch.location == NormalizedPoint(point: CGPoint(x: 0, y: 199), in: frame))
+  }
+
+  @Test("Mac special keys map to semantic device keys")
+  func macSpecialKeysAreSemantic() {
+    #expect(MacInputMap.specialKey(macKeyCode: 36) == .enter)
+    #expect(MacInputMap.specialKey(macKeyCode: 51) == .backspace)
+    #expect(MacInputMap.specialKey(macKeyCode: 123) == .leftArrow)
+    #expect(MacInputMap.shortcutKey(for: "C") == .character("c"))
+  }
+
+  @Test("Mac modifiers retain platform-independent meaning")
+  func macModifiersStayIndependent() {
+    let modifiers = MacInputMap.modifiers(from: [.command, .option])
+    #expect(modifiers.contains(.command))
+    #expect(modifiers.contains(.option))
+    #expect(!modifiers.contains(.control))
+  }
+
+  @Test("Android adapts semantic keys to its existing keycodes")
+  func androidKeycodesRemainStable() {
+    let expected: [(DeviceKey, Int)] = [
+      (.enter, 66),
+      (.keypadEnter, 66),
+      (.backspace, 67),
+      (.forwardDelete, 112),
+      (.tab, 61),
+      (.escape, 111),
+      (.leftArrow, 21),
+      (.rightArrow, 22),
+      (.downArrow, 20),
+      (.upArrow, 19),
+      (.home, 122),
+      (.end, 123),
+      (.pageUp, 92),
+      (.pageDown, 93),
+      (.character("a"), 29),
+      (.character("z"), 54),
+      (.character("0"), 7),
+      (.character("9"), 16),
+    ]
+
+    for (key, keycode) in expected {
+      #expect(AndroidKeyMap.keycode(for: key) == keycode)
+    }
+  }
+
+  @Test("Android alone maps Mac Command to Control")
+  func androidMapsCommandToControl() {
+    let meta = AndroidKeyMap.metaState(from: [.command, .shift, .option])
+    #expect(meta & AndroidKeyMap.metaCtrl != 0)
+    #expect(meta & AndroidKeyMap.metaShift != 0)
+    #expect(meta & AndroidKeyMap.metaAlt != 0)
+  }
+}
+
 @MainActor
 @Suite("Scroll → swipe state machine")
 struct ScrollSwipeMapperTests {

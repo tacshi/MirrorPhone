@@ -249,7 +249,7 @@ final class AndroidADBDeviceMonitor: @unchecked Sendable {
 }
 
 @MainActor
-final class AndroidADBMirrorSource: MirrorSource, TouchInputSink {
+final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
   /// Fired when the input injector dies unexpectedly, so the UI can abandon any
@@ -267,18 +267,29 @@ final class AndroidADBMirrorSource: MirrorSource, TouchInputSink {
     self.deviceName = deviceName
   }
 
-  var touchSink: TouchInputSink? { self }
+  var inputSink: DeviceInputSink? { self }
 
-  func send(_ phase: TouchPhase, x: Int, y: Int, frameWidth: Int, frameHeight: Int) {
-    inputRunner?.send(phase, x: x, y: y, frameWidth: frameWidth, frameHeight: frameHeight)
-  }
-
-  func sendKey(down: Bool, keycode: Int, metaState: Int) {
-    inputRunner?.sendKey(down: down, keycode: keycode, metaState: metaState)
-  }
-
-  func sendText(_ text: String) {
-    inputRunner?.sendText(text)
+  func send(_ event: DeviceInputEvent) {
+    switch event {
+    case .touch(let touch):
+      let point = touch.location.point(in: touch.referenceSize)
+      inputRunner?.send(
+        touch.phase,
+        x: Int(point.x.rounded()),
+        y: Int(point.y.rounded()),
+        frameWidth: Int(touch.referenceSize.width.rounded()),
+        frameHeight: Int(touch.referenceSize.height.rounded())
+      )
+    case .key(let key):
+      guard let keycode = AndroidKeyMap.keycode(for: key.key) else { return }
+      inputRunner?.sendKey(
+        down: key.phase == .down,
+        keycode: keycode,
+        metaState: AndroidKeyMap.metaState(from: key.modifiers)
+      )
+    case .text(let text):
+      inputRunner?.sendText(text)
+    }
   }
 
   func start() async throws {

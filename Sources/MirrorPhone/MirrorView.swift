@@ -81,19 +81,14 @@ struct MirrorWindowSizeMemory {
 @MainActor
 final class MirrorView: NSView {
   private(set) var displayedFrame: CGImage?
-  /// Forwards a touch event (device-pixel point + frame size) to the device.
-  /// `nil` when the active source can't accept input (iOS), which turns all
-  /// mouse handling into a no-op that falls through to the responder chain.
-  var onTouch: ((TouchPhase, CGPoint, CGSize) -> Void)?
-  /// Forwards a key press: (down, Android keycode, Android meta state).
-  var onKey: ((Bool, Int, Int) -> Void)?
-  /// Forwards printable text to type on the device.
-  var onText: ((String) -> Void)?
+  /// Forwards platform-neutral mouse and keyboard input. `nil` when the active
+  /// source can't accept input, which leaves normal responder behavior intact.
+  var onInput: ((DeviceInputEvent) -> Void)?
   private let scrollMapper = ScrollSwipeMapper()
   private var dragActive = false
-  /// macOS keycodes currently held that were forwarded as Android key-downs,
-  /// so their key-ups are forwarded too (and only those).
-  private var forwardedKeys: [UInt16: Int] = [:]
+  /// macOS keycodes currently held that were forwarded as key-downs, so their
+  /// key-ups are forwarded too (and only those).
+  private var forwardedKeys: [UInt16: DeviceKey] = [:]
   private let tutorial = NSStackView()
   private let loading = NSStackView()
   private let loadingIndicator = NSProgressIndicator()
@@ -108,7 +103,7 @@ final class MirrorView: NSView {
     super.init(frame: frameRect)
     configureTutorial()
     scrollMapper.emit = { [weak self] phase, point, frame in
-      self?.onTouch?(phase, point, frame)
+      self?.emitTouch(phase, point: point, referenceSize: frame)
     }
   }
 
@@ -116,7 +111,7 @@ final class MirrorView: NSView {
     super.init(coder: coder)
     configureTutorial()
     scrollMapper.emit = { [weak self] phase, point, frame in
-      self?.onTouch?(phase, point, frame)
+      self?.emitTouch(phase, point: point, referenceSize: frame)
     }
   }
 
@@ -134,7 +129,7 @@ final class MirrorView: NSView {
   // MARK: - Mouse forwarding
 
   override func mouseDown(with event: NSEvent) {
-    guard let onTouch, let size = frameSize else { return super.mouseDown(with: event) }
+    guard onInput != nil, let size = frameSize else { return super.mouseDown(with: event) }
     let point = convert(event.locationInWindow, from: nil)
     let rect = MirrorLayout.widthFillingRect(imageSize: size, in: bounds)
     // A click outside the drawn frame (letterbox) is ignored, not clamped.
@@ -143,29 +138,34 @@ final class MirrorView: NSView {
     else { return }
     scrollMapper.finishImmediately()
     dragActive = true
-    onTouch(.down, device, size)
+    emitTouch(.down, point: device, referenceSize: size)
   }
 
   override func mouseDragged(with event: NSEvent) {
-    guard dragActive, let onTouch, let size = frameSize else { return super.mouseDragged(with: event) }
+    guard dragActive, onInput != nil, let size = frameSize else {
+      return super.mouseDragged(with: event)
+    }
     let point = convert(event.locationInWindow, from: nil)
     guard let device = MirrorLayout.devicePoint(viewPoint: point, imageSize: size, in: bounds)
     else { return }
-    onTouch(.move, device, size)
+    emitTouch(.move, point: device, referenceSize: size)
   }
 
   override func mouseUp(with event: NSEvent) {
-    guard dragActive, let onTouch, let size = frameSize else { return super.mouseUp(with: event) }
+    guard dragActive, onInput != nil, let size = frameSize else {
+      return super.mouseUp(with: event)
+    }
     dragActive = false
     let point = convert(event.locationInWindow, from: nil)
-    let device = MirrorLayout.devicePoint(viewPoint: point, imageSize: size, in: bounds)
+    let device =
+      MirrorLayout.devicePoint(viewPoint: point, imageSize: size, in: bounds)
       ?? CGPoint(x: 0, y: 0)
-    onTouch(.up, device, size)
+    emitTouch(.up, point: device, referenceSize: size)
   }
 
   override func scrollWheel(with event: NSEvent) {
     // A mouse drag owns the finger; ignore scroll until it ends.
-    guard !dragActive, let onTouch, let size = frameSize else {
+    guard !dragActive, onInput != nil, let size = frameSize else {
       return super.scrollWheel(with: event)
     }
     let point = convert(event.locationInWindow, from: nil)
@@ -185,39 +185,40 @@ final class MirrorView: NSView {
       dy: event.scrollingDeltaY * sensitivity * scale
     )
     let momentumEnded = event.momentumPhase == .ended || event.phase == .cancelled
-    scrollMapper.handleScroll(delta: delta, cursor: cursor, frame: size, momentumEnded: momentumEnded)
+    scrollMapper.handleScroll(
+      delta: delta, cursor: cursor, frame: size, momentumEnded: momentumEnded)
   }
 
   // MARK: - Keyboard forwarding
 
   override func keyDown(with event: NSEvent) {
-    guard onKey != nil || onText != nil, displayedFrame != nil else {
+    guard onInput != nil, displayedFrame != nil else {
       return super.keyDown(with: event)
     }
-    let meta = AndroidKeyMap.metaState(from: event.modifierFlags)
+    let modifiers = MacInputMap.modifiers(from: event.modifierFlags)
 
-    if let keycode = AndroidKeyMap.specialKeycode(macKeyCode: event.keyCode) {
+    if let key = MacInputMap.specialKey(macKeyCode: event.keyCode) {
       if !event.isARepeat {
-        forwardedKeys[event.keyCode] = keycode
+        forwardedKeys[event.keyCode] = key
       }
-      onKey?(true, keycode, meta)
+      onInput?(.key(DeviceKeyEvent(phase: .down, key: key, modifiers: modifiers)))
       return
     }
 
-    // ⌘/⌃ + letter/digit → Android Ctrl shortcut (⌘C = copy, ⌘V = paste, …).
+    // Preserve shortcut keys and modifiers so each platform can translate them.
     if event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control),
       let character = event.charactersIgnoringModifiers?.first,
-      let keycode = AndroidKeyMap.shortcutKeycode(for: character)
+      let key = MacInputMap.shortcutKey(for: character)
     {
       if !event.isARepeat {
-        forwardedKeys[event.keyCode] = keycode
+        forwardedKeys[event.keyCode] = key
       }
-      onKey?(true, keycode, meta)
+      onInput?(.key(DeviceKeyEvent(phase: .down, key: key, modifiers: modifiers)))
       return
     }
 
-    if let text = AndroidKeyMap.textToType(from: event) {
-      onText?(text)
+    if let text = MacInputMap.textToType(from: event) {
+      onInput?(.text(text))
       return
     }
 
@@ -225,10 +226,18 @@ final class MirrorView: NSView {
   }
 
   override func keyUp(with event: NSEvent) {
-    guard let keycode = forwardedKeys.removeValue(forKey: event.keyCode) else {
+    guard let key = forwardedKeys.removeValue(forKey: event.keyCode) else {
       return super.keyUp(with: event)
     }
-    onKey?(false, keycode, AndroidKeyMap.metaState(from: event.modifierFlags))
+    onInput?(
+      .key(
+        DeviceKeyEvent(
+          phase: .up,
+          key: key,
+          modifiers: MacInputMap.modifiers(from: event.modifierFlags)
+        )
+      )
+    )
   }
 
   /// Abandon any in-flight gesture (source teardown, injector restart).
@@ -236,11 +245,22 @@ final class MirrorView: NSView {
     if dragActive {
       dragActive = false
       if let size = frameSize {
-        onTouch?(.cancel, CGPoint(x: 0, y: 0), size)
+        emitTouch(.cancel, point: .zero, referenceSize: size)
       }
     }
     scrollMapper.cancel()
     forwardedKeys.removeAll()
+  }
+
+  private func emitTouch(_ phase: TouchPhase, point: CGPoint, referenceSize: CGSize) {
+    guard
+      let event = DeviceTouchEvent(
+        phase: phase,
+        point: point,
+        referenceSize: referenceSize
+      )
+    else { return }
+    onInput?(.touch(event))
   }
 
   override func draw(_ dirtyRect: NSRect) {

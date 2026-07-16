@@ -5,7 +5,8 @@ import Foundation
 /// swipe: a finger goes down at the cursor on the first scroll, follows the
 /// accumulated scroll delta, and lifts after a short pause (or when momentum
 /// ends). All positions are in device-frame pixels; the owning view converts
-/// view points and picks a sensitivity per input class.
+/// view points, picks a sensitivity per input class, and normalizes emitted
+/// touches before they cross the platform-neutral input boundary.
 @MainActor
 final class ScrollSwipeMapper {
   /// Emits a touch event: phase, device-pixel position, and the frame size the
