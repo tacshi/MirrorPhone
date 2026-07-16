@@ -1,50 +1,114 @@
-# MirrorPhone
+<p align="center">
+  <img src="Resources/MirrorPhone.png" width="160" height="160" alt="MirrorPhone app icon">
+</p>
 
-A native Swift + AppKit viewer for USB-connected iOS and Android devices. It is intentionally view-only: device interaction is disabled, and no companion app is installed on the phone.
+<h1 align="center">MirrorPhone</h1>
 
-## USB backends
+<p align="center">Mirror iPhone, iPad, and Android screens over USB on macOS.</p>
 
-- **iPhone/iPad:** enables macOS's CoreMediaIO screen-capture devices and receives the trusted device's muxed display stream through AVFoundation, using the same system path exposed to QuickTime capture. The muxed stream carries the device's audio, which MirrorPhone plays through the Mac's default output.
-- **Android:** uses ADB over USB debugging to receive the device's built-in `screenrecord` H.264 stream. MirrorPhone decodes it directly with VideoToolbox and automatically refreshes the stream when Android's three-minute recording window ends. Because `screenrecord` is video-only, device audio is captured separately (scrcpy-style): a tiny `app_process` helper is run over ADB to stream the output mix (`REMOTE_SUBMIX`) as PCM, which the Mac plays. Audio requires **Android 11 or newer** and is best-effort — mirroring continues without it.
+MirrorPhone is a native Swift and AppKit application for viewing mobile devices from a Mac. It uses the system USB capture path for iPhone and iPad, and ADB for Android. Android devices can also be controlled with the Mac's mouse, trackpad, and keyboard.
 
-The app discovers connected devices continuously, selects the first one automatically, and switches immediately when another device is selected. No iOS app, Android APK, ADB command-line interaction, network connection, or cloud service is required at runtime. The packaged Mac app includes the local ADB binary found when it is built.
+All device communication stays local. MirrorPhone does not use a network service or cloud relay.
 
-## Build and run
+## Platform support
+
+| | Video | Audio | Input |
+| --- | --- | --- | --- |
+| iPhone and iPad | USB capture through CoreMediaIO and AVFoundation | Included in the muxed capture stream | View-only |
+| Android | ADB `screenrecord`, decoded with VideoToolbox | Android 11 or later; device-dependent | Mouse, trackpad, and keyboard on Android 11 or later |
+
+iOS and iPadOS do not expose a public system-wide input-injection API comparable to Android's ADB interface. MirrorPhone therefore does not forward input to Apple mobile devices.
+
+## Features
+
+- Automatic discovery of connected iPhone, iPad, and Android devices
+- Low-latency native video decoding and orientation changes
+- iPhone and iPad audio through the USB capture stream
+- Android taps, drags, scrolling, text entry, navigation keys, and keyboard shortcuts
+- Automatic recovery when Android's `screenrecord` session reaches its time limit
+- Actual-size display mode and PNG frame capture
+- No iOS companion app or Android APK installation
+
+For Android audio and input, the build packages small dex helpers that are copied to `/data/local/tmp` and launched as the ADB shell user with `app_process`. They are not installed as applications.
+
+## Requirements
+
+- macOS 14 or later
+- Xcode with a Swift 6.2 toolchain
+- A data-capable USB cable
+- Android SDK Platform Tools (`adb`) for Android support
+- Android SDK platform files, Build Tools (`d8`), and a JDK for Android audio and input support
+
+The video-only iPhone and iPad build does not require the Android SDK.
+
+## Build
+
+Clone the repository, then run:
 
 ```sh
 ./build-debug.sh
 open MirrorPhone.app
 ```
 
-The build automatically uses the first Developer ID Application identity in Keychain so macOS privacy permissions remain associated with the app across rebuilds. Set `MIRRORPHONE_SIGNING_IDENTITY` to override it. It falls back to an ad-hoc signature only when no Developer ID identity is available.
+Despite its name, `build-debug.sh` builds an optimized executable by default because the H.264 decode path must keep pace with high-refresh-rate displays. Set `MIRRORPHONE_BUILD_CONFIGURATION=debug` when a debug build is required.
 
-Create a signed and notarized release disk image with:
+The script packages the app, bundles `adb` from `PATH` or the standard Android SDK location, and builds the Android helpers when the required SDK tools are available. Missing Android helper dependencies do not stop the build; the affected audio or input feature is disabled instead.
+
+Useful build overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| `MIRRORPHONE_SIGNING_IDENTITY` | Code-signing identity; falls back to ad hoc signing when none is available |
+| `MIRRORPHONE_BUILD_CONFIGURATION` | Swift build configuration, `release` or `debug` |
+| `MIRRORPHONE_ANDROID_AUDIO_JAR` | Runtime path to a prebuilt Android audio helper |
+| `MIRRORPHONE_ANDROID_INPUT_JAR` | Runtime path to a prebuilt Android input helper |
+
+Run the test suite with:
 
 ```sh
-./build-dmg.sh 1.0.0
+swift test
 ```
-
-The version argument is applied to the packaged app and installer metadata and used in the disk-image filename. The release script selects the Developer ID Application certificate for team `X5X4TD477G`, submits with the stored `MirrorPhone` notarytool profile, and writes the stapled disk image under `dist/`. Set `MIRRORPHONE_SIGNING_IDENTITY`, `MIRRORPHONE_TEAM_ID`, or `MIRRORPHONE_NOTARY_PROFILE` to override those defaults.
-
-Install Android SDK Platform Tools on the build Mac so `build-debug.sh` can bundle `adb`. During Swift development, MirrorPhone also finds `adb` through `ANDROID_SDK_ROOT`, `ANDROID_HOME`, the standard Android SDK folder, Homebrew, or `PATH`.
-
-Android audio additionally needs a full Android SDK (`android.jar` plus `d8`) and `javac` at build time: `build-debug.sh` compiles the device-side capturer (`AndroidAudioServer/`) into a dex jar and bundles it under `Contents/Resources`. If the SDK is missing the build still succeeds, and Android mirroring is video-only. Set `MIRRORPHONE_ANDROID_AUDIO_JAR` to point the app at a prebuilt jar during Swift development.
 
 ## Connect a device
 
 ### iPhone or iPad
 
-1. Connect the unlocked device with a data-capable USB cable.
+1. Connect the unlocked device by USB.
 2. Tap **Trust** on the device if prompted.
-3. If macOS asks for video access, allow MirrorPhone. The app first opens the muxed USB screen device directly and only shows permission recovery when AVFoundation rejects that input.
-4. If macOS asks for microphone access, allow it to hear the device. Audio rides on the same muxed capture device; denying it only mutes playback and leaves video mirroring intact.
+3. Allow video access when macOS requests it.
+4. Allow microphone access to hear device audio. Denying it leaves video capture available.
+
+The device remains view-only in MirrorPhone.
 
 ### Android
 
 1. Enable Developer options and USB debugging.
-2. Connect the unlocked device with a data-capable USB cable and choose a USB mode that exposes debugging, such as File Transfer.
-3. Accept the device's **Allow USB debugging** prompt.
+2. Connect the unlocked device by USB and select a USB mode that permits debugging, such as File Transfer.
+3. Accept the **Allow USB debugging** prompt on the device.
 
-Android audio (11+) plays through the Mac automatically. It relies on the `REMOTE_SUBMIX` output mix, whose routing is device- and OEM-dependent: the phone may fall silent while its audio is redirected to the Mac, and audio that was already playing when mirroring started can take a moment to route in (restart playback on the phone if a stream stays silent). Some vendors restrict output-audio capture entirely, in which case mirroring stays video-only.
+Click or drag in the mirrored display to send touch input. Mouse-wheel and trackpad scrolling are translated into swipe gestures. When the MirrorPhone window is active, text, navigation keys, and common Command-key shortcuts are forwarded to Android.
 
-The window follows the received frame orientation and remains fitted to the mobile display width. Use the toolbar or View menu for actual size and the camera button or File menu to save the current frame as PNG.
+Android audio and input require Android 11 or later. Audio capture depends on Android version and vendor policy; unsupported devices continue mirroring without sound. The phone may be muted while its output is routed to the Mac.
+
+## Application shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| <kbd>Command</kbd> + <kbd>0</kbd> | Show the current frame at actual size |
+| <kbd>Command</kbd> + <kbd>S</kbd> | Save the current frame as a PNG |
+
+## Release build
+
+`build-dmg.sh` creates a signed, notarized disk image:
+
+```sh
+MIRRORPHONE_TEAM_ID="YOUR_TEAM_ID" \
+MIRRORPHONE_NOTARY_PROFILE="YOUR_NOTARYTOOL_PROFILE" \
+./build-dmg.sh 1.0.0
+```
+
+Set `MIRRORPHONE_SIGNING_IDENTITY` if more than one Developer ID Application certificate is installed. The finished disk image is written to `dist/`.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Please include the macOS version, device model, mobile OS version, and relevant build or runtime output when reporting device-specific problems.
