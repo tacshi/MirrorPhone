@@ -53,6 +53,15 @@ else
   echo "warning: Android audio server was not built; Android mirroring will be video-only" >&2
 fi
 
+INPUT_JAR="$("$ROOT/build-android-input-server.sh" | tail -n1 || true)"
+if [[ -n "$INPUT_JAR" && -f "$INPUT_JAR" ]]; then
+  # Device-side data pushed over adb, never executed on the Mac; lives in
+  # Resources so codesign does not treat it as nested code.
+  cp "$INPUT_JAR" "$APP_DIR/Contents/Resources/mirrorphone-input-server.jar"
+else
+  echo "warning: Android input server was not built; Android touch forwarding will be unavailable" >&2
+fi
+
 codesign \
   --force \
   --options runtime \

@@ -249,18 +249,36 @@ final class AndroidADBDeviceMonitor: @unchecked Sendable {
 }
 
 @MainActor
-final class AndroidADBMirrorSource: MirrorSource {
+final class AndroidADBMirrorSource: MirrorSource, TouchInputSink {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
+  /// Fired when the input injector dies unexpectedly, so the UI can abandon any
+  /// in-flight gesture instead of continuing it against a fresh server.
+  var onInputInterrupted: (() -> Void)?
 
   private let serial: String
   private let deviceName: String
   private var runner: AndroidScreenrecordRunner?
   private var audioRunner: AndroidAudioRunner?
+  private var inputRunner: AndroidInputRunner?
 
   init(serial: String, deviceName: String) {
     self.serial = serial
     self.deviceName = deviceName
+  }
+
+  var touchSink: TouchInputSink? { self }
+
+  func send(_ phase: TouchPhase, x: Int, y: Int, frameWidth: Int, frameHeight: Int) {
+    inputRunner?.send(phase, x: x, y: y, frameWidth: frameWidth, frameHeight: frameHeight)
+  }
+
+  func sendKey(down: Bool, keycode: Int, metaState: Int) {
+    inputRunner?.sendKey(down: down, keycode: keycode, metaState: metaState)
+  }
+
+  func sendText(_ text: String) {
+    inputRunner?.sendText(text)
   }
 
   func start() async throws {
@@ -302,6 +320,25 @@ final class AndroidADBMirrorSource: MirrorSource {
     audioRunner.start()
     self.audioRunner = audioRunner
 
+    // Forward Mac mouse/scroll gestures to the device as touch events. Also
+    // best-effort: touch is unavailable rather than failing the mirror.
+    let inputRunner = AndroidInputRunner(
+      adbURL: adbURL,
+      serial: serial,
+      onStatus: { [weak self] status in
+        Task { @MainActor [weak self] in
+          self?.onStatus?(status)
+        }
+      },
+      onInterrupted: { [weak self] in
+        Task { @MainActor [weak self] in
+          self?.onInputInterrupted?()
+        }
+      }
+    )
+    inputRunner.start()
+    self.inputRunner = inputRunner
+
     onStatus?("Connected to \(deviceName) by USB · waiting for video")
   }
 
@@ -310,6 +347,8 @@ final class AndroidADBMirrorSource: MirrorSource {
     self.runner = nil
     audioRunner?.stop()
     audioRunner = nil
+    inputRunner?.stop()
+    inputRunner = nil
     await runner?.stop()
   }
 }

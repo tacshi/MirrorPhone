@@ -249,6 +249,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     connectionTask?.cancel()
     let previousSource = source
     source = nil
+    mirrorView.resetInputState()
+    mirrorView.onTouch = nil
+    mirrorView.onKey = nil
+    mirrorView.onText = nil
     activeDeviceName = device.name
     receivedFirstFrame = false
     reportedFrameSize = nil
@@ -283,6 +287,35 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         guard let self, selectedDeviceID == device.id else { return }
         setStatus(message)
       }
+      // Forward Mac mouse/scroll gestures to sources that accept input (Android);
+      // iOS sources return a nil sink and mouse handling stays a no-op.
+      if let sink = newSource.touchSink {
+        mirrorView.onTouch = { [weak sink] phase, point, frame in
+          sink?.send(
+            phase,
+            x: Int(point.x.rounded()),
+            y: Int(point.y.rounded()),
+            frameWidth: Int(frame.width),
+            frameHeight: Int(frame.height)
+          )
+        }
+        mirrorView.onKey = { [weak sink] down, keycode, meta in
+          sink?.sendKey(down: down, keycode: keycode, metaState: meta)
+        }
+        mirrorView.onText = { [weak sink] text in
+          sink?.sendText(text)
+        }
+        window?.makeFirstResponder(mirrorView)
+      } else {
+        mirrorView.onTouch = nil
+        mirrorView.onKey = nil
+        mirrorView.onText = nil
+      }
+      if let android = newSource as? AndroidADBMirrorSource {
+        android.onInputInterrupted = { [weak self] in
+          self?.mirrorView.resetInputState()
+        }
+      }
       source = newSource
 
       do {
@@ -312,6 +345,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     connectionGeneration += 1
     let generation = connectionGeneration
     connectionTask?.cancel()
+    mirrorView.resetInputState()
+    mirrorView.onTouch = nil
+    mirrorView.onKey = nil
+    mirrorView.onText = nil
     let previousSource = source
     source = nil
     connectionTask = Task { [weak self] in
