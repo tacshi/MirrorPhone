@@ -170,6 +170,11 @@ playground.xcworkspace
 # .swiftpm
 
 .build/
+dist/
+MirrorPhone.app/
+Companion/MirrorPhoneCompanion.xcodeproj/
+AndroidCompanion/.gradle/
+AndroidCompanion/app/build/
 
 # CocoaPods
 # We recommend against adding the Pods directory to your .gitignore. However
