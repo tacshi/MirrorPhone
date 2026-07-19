@@ -55,6 +55,43 @@ struct AndroidUSBTests {
     )
   }
 
+  @Test("Parses Android display size and creates an encoder-safe fallback")
+  func parsesDisplaySize() {
+    #expect(
+      AndroidDisplaySize.parseWMSize("Physical size: 1920x2560\n")
+        == AndroidDisplaySize(width: 1920, height: 2560)
+    )
+    #expect(
+      AndroidDisplaySize.parseWMSize(
+        "Physical size: 1920x2560\nOverride size: 1440x1920\n"
+      ) == AndroidDisplaySize(width: 1440, height: 1920)
+    )
+    #expect(
+      AndroidDisplaySize(width: 1920, height: 2560).screenrecordFallback
+        == AndroidDisplaySize(width: 1080, height: 1440)
+    )
+    #expect(
+      AndroidDisplaySize(width: 2560, height: 1920).screenrecordFallback
+        == AndroidDisplaySize(width: 1440, height: 1080)
+    )
+  }
+
+  @Test("Uses framebuffer polling for Smart X3 Pro")
+  func selectsEInkCaptureCompatibility() {
+    #expect(AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: "Smart X3 Pro"))
+    #expect(!AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: "Pixel 9"))
+  }
+
+  @Test("Parses fragmented consecutive PNG images")
+  func parsesPNGStream() {
+    let first = fakePNG(payload: Data([1, 2, 3]))
+    let second = fakePNG(payload: Data([4, 5]))
+    var parser = PNGStreamParser()
+
+    #expect(parser.append(Data(first.prefix(11))).isEmpty)
+    #expect(parser.append(Data(first.dropFirst(11)) + second) == [first, second])
+  }
+
   @Test("Parses Annex B start codes split across reads")
   func parsesSplitAnnexBStream() {
     var parser = AnnexBParser()
@@ -80,5 +117,17 @@ struct AndroidUSBTests {
 
     #expect(units == [Data([0x65, 0x88]), Data([0x41, 0x9A])])
     #expect(parser.finish() == Data([0x06, 0x05]))
+  }
+
+  private func fakePNG(payload: Data) -> Data {
+    var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    png.appendUInt32(UInt32(payload.count))
+    png.append(Data("IDAT".utf8))
+    png.append(payload)
+    png.append(Data(repeating: 0, count: 4))
+    png.appendUInt32(0)
+    png.append(Data("IEND".utf8))
+    png.append(Data(repeating: 0, count: 4))
+    return png
   }
 }
