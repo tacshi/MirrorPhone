@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 
 struct AndroidADBDevice: Equatable, Sendable {
   let serial: String
@@ -139,6 +140,55 @@ struct AndroidRotationLogParser {
   }
 }
 
+struct AndroidDisplaySize: Equatable, Sendable {
+  let width: Int
+  let height: Int
+
+  static func parseWMSize(_ output: String) -> AndroidDisplaySize? {
+    let sizes: [AndroidDisplaySize] = output.split(whereSeparator: \Character.isNewline).compactMap {
+      line -> AndroidDisplaySize? in
+      guard let colon = line.lastIndex(of: ":") else { return nil }
+      let dimensions = String(line[line.index(after: colon)...])
+        .trimmingCharacters(in: .whitespaces)
+        .split(separator: "x", maxSplits: 1)
+      guard dimensions.count == 2,
+        let width = Int(dimensions[0]), let height = Int(dimensions[1]),
+        width > 0, height > 0
+      else { return nil }
+      return AndroidDisplaySize(width: width, height: height)
+    }
+    // `wm size` prints the physical size first and an override second. The
+    // override is the size screenrecord actually sees, so prefer the last one.
+    return sizes.last
+  }
+
+  /// A conservative AVC size for vendor encoders which reject the native
+  /// display resolution. Preserve the display aspect ratio while keeping the
+  /// short edge at 1080 and the long edge at 1920 or less.
+  var screenrecordFallback: AndroidDisplaySize {
+    let shortEdge = min(width, height)
+    let longEdge = max(width, height)
+    var scale = min(1, min(1080.0 / Double(shortEdge), 1920.0 / Double(longEdge)))
+    if scale == 1 {
+      scale = 0.75
+    }
+
+    func encoderAligned(_ value: Int) -> Int {
+      max(2, Int((Double(value) * scale).rounded(.down)) / 2 * 2)
+    }
+    return AndroidDisplaySize(width: encoderAligned(width), height: encoderAligned(height))
+  }
+}
+
+enum AndroidVideoCompatibility {
+  /// iReader's Smart X3 Pro `screenrecord` encoder emits its initial frame but
+  /// never sees later e-ink compositor refreshes. Direct framebuffer captures
+  /// are the only ADB path that continues to reflect the live display.
+  static func requiresFramebufferPolling(deviceName: String) -> Bool {
+    deviceName.localizedCaseInsensitiveContains("Smart X3 Pro")
+  }
+}
+
 final class AndroidADBDeviceMonitor: @unchecked Sendable {
   typealias DevicesHandler = @Sendable ([AndroidADBDevice]) -> Void
 
@@ -258,7 +308,7 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
 
   private let serial: String
   private let deviceName: String
-  private var runner: AndroidScreenrecordRunner?
+  private var runner: (any AndroidVideoRunner)?
   private var audioRunner: AndroidAudioRunner?
   private var inputRunner: AndroidInputRunner?
 
@@ -299,20 +349,32 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
       )
     }
 
-    let runner = AndroidScreenrecordRunner(
-      adbURL: adbURL,
-      serial: serial,
-      onFrame: { [weak self] frame in
-        Task { @MainActor [weak self] in
-          self?.onFrame?(frame)
-        }
-      },
-      onStatus: { [weak self] status in
-        Task { @MainActor [weak self] in
-          self?.onStatus?(status)
-        }
+    let frameHandler: @Sendable (CGImage) -> Void = { [weak self] frame in
+      Task { @MainActor [weak self] in
+        self?.onFrame?(frame)
       }
-    )
+    }
+    let statusHandler: @Sendable (String) -> Void = { [weak self] status in
+      Task { @MainActor [weak self] in
+        self?.onStatus?(status)
+      }
+    }
+    let runner: any AndroidVideoRunner =
+      if AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: deviceName) {
+        AndroidFramebufferRunner(
+          adbURL: adbURL,
+          serial: serial,
+          onFrame: frameHandler,
+          onStatus: statusHandler
+        )
+      } else {
+        AndroidScreenrecordRunner(
+          adbURL: adbURL,
+          serial: serial,
+          onFrame: frameHandler,
+          onStatus: statusHandler
+        )
+      }
     try runner.start()
     self.runner = runner
 
@@ -364,7 +426,12 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
   }
 }
 
-private final class AndroidScreenrecordRunner: @unchecked Sendable {
+private protocol AndroidVideoRunner: AnyObject, Sendable {
+  func start() throws
+  func stop() async
+}
+
+private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Sendable {
   typealias FrameHandler = @Sendable (CGImage) -> Void
   typealias StatusHandler = @Sendable (String) -> Void
 
@@ -387,6 +454,10 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
   private var rotationParser = AndroidRotationLogParser()
   private var lastRotation: Int?
   private var rotationRestartLaunchID: UUID?
+  private var fallbackSize: AndroidDisplaySize?
+  private var activeSize: AndroidDisplaySize?
+  private var receivedVideoStream = false
+  private var streamOutput = Data()
   private var stopped = true
 
   init(
@@ -406,6 +477,7 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
       guard stopped else { return }
       stopped = false
       do {
+        fallbackSize = queryDisplaySize()?.screenrecordFallback
         try launch()
         try launchRotationMonitor()
       } catch {
@@ -435,6 +507,10 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
         rotationParser.reset()
         lastRotation = nil
         rotationRestartLaunchID = nil
+        fallbackSize = nil
+        activeSize = nil
+        receivedVideoStream = false
+        streamOutput.removeAll(keepingCapacity: false)
         streamDecoder.reset()
         continuation.resume()
       }
@@ -449,15 +525,21 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
 
     streamDecoder.reset()
     errorOutput.removeAll(keepingCapacity: true)
+    streamOutput.removeAll(keepingCapacity: true)
+    receivedVideoStream = false
     activeLaunchID = launchID
     process.executableURL = adbURL
-    process.arguments = [
+    var arguments = [
       "-s", serial,
       "exec-out", "screenrecord",
       "--output-format=h264",
       "--bit-rate", "12000000",
-      "-",
     ]
+    if let activeSize {
+      arguments.append(contentsOf: ["--size", "\(activeSize.width)x\(activeSize.height)"])
+    }
+    arguments.append("-")
+    process.arguments = arguments
     process.standardOutput = outputPipe
     process.standardError = errorPipe
 
@@ -469,7 +551,10 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
       }
       self?.queue.async { [weak self] in
         guard let self, activeLaunchID == launchID, !stopped else { return }
-        streamDecoder.consume(data)
+        if !receivedVideoStream, streamOutput.count < 16_384 {
+          streamOutput.append(data.prefix(16_384 - streamOutput.count))
+        }
+        receivedVideoStream = streamDecoder.consume(data) || receivedVideoStream
       }
     }
     errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -626,7 +711,25 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
       return
     }
 
-    let detail = String(data: errorOutput, encoding: .utf8)?
+    if !receivedVideoStream, activeSize == nil, let fallbackSize {
+      activeSize = fallbackSize
+      onStatus(
+        "The Android encoder rejected native resolution · retrying at "
+          + "\(fallbackSize.width) × \(fallbackSize.height)"
+      )
+      queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        guard let self, !stopped, process == nil else { return }
+        do {
+          try launch()
+        } catch {
+          onStatus(error.localizedDescription)
+        }
+      }
+      return
+    }
+
+    let diagnosticOutput = errorOutput.isEmpty ? streamOutput : errorOutput
+    let detail = String(data: diagnosticOutput, encoding: .utf8)?
       .trimmingCharacters(in: .whitespacesAndNewlines)
     if status != 0, let detail, !detail.isEmpty {
       onStatus("Android USB stream ended: \(detail) · retrying")
@@ -642,6 +745,224 @@ private final class AndroidScreenrecordRunner: @unchecked Sendable {
         onStatus(error.localizedDescription)
       }
     }
+  }
+
+  private func queryDisplaySize() -> AndroidDisplaySize? {
+    let process = Process()
+    let outputPipe = Pipe()
+    process.executableURL = adbURL
+    process.arguments = ["-s", serial, "shell", "wm", "size"]
+    process.standardOutput = outputPipe
+    process.standardError = FileHandle.nullDevice
+    do {
+      try process.run()
+      let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+      process.waitUntilExit()
+      guard process.terminationStatus == 0,
+        let output = String(data: data, encoding: .utf8)
+      else { return nil }
+      return AndroidDisplaySize.parseWMSize(output)
+    } catch {
+      return nil
+    }
+  }
+}
+
+private final class AndroidFramebufferRunner: AndroidVideoRunner, @unchecked Sendable {
+  typealias FrameHandler = @Sendable (CGImage) -> Void
+  typealias StatusHandler = @Sendable (String) -> Void
+
+  private let adbURL: URL
+  private let serial: String
+  private let onFrame: FrameHandler
+  private let onStatus: StatusHandler
+  private let queue = DispatchQueue(
+    label: "com.rockyshi.mirrorphone.android-framebuffer",
+    qos: .userInteractive
+  )
+  private var process: Process?
+  private var outputPipe: Pipe?
+  private var activeLaunchID: UUID?
+  private var reconnectWorkItem: DispatchWorkItem?
+  private var parser = PNGStreamParser()
+  private var stopped = true
+
+  init(
+    adbURL: URL,
+    serial: String,
+    onFrame: @escaping FrameHandler,
+    onStatus: @escaping StatusHandler
+  ) {
+    self.adbURL = adbURL
+    self.serial = serial
+    self.onFrame = onFrame
+    self.onStatus = onStatus
+  }
+
+  func start() throws {
+    try queue.sync {
+      guard stopped else { return }
+      stopped = false
+      do {
+        try launch()
+        onStatus("Using live framebuffer capture for this e-ink device")
+      } catch {
+        stopped = true
+        throw error
+      }
+    }
+  }
+
+  func stop() async {
+    await withCheckedContinuation { continuation in
+      queue.async { [self] in
+        stopped = true
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        activeLaunchID = nil
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        if let process, process.isRunning {
+          process.terminate()
+        }
+        process = nil
+        outputPipe = nil
+        parser.reset()
+        continuation.resume()
+      }
+    }
+  }
+
+  private func launch() throws {
+    guard !stopped, process == nil else { return }
+    let launchID = UUID()
+    let process = Process()
+    let outputPipe = Pipe()
+    process.executableURL = adbURL
+    process.arguments = [
+      "-s", serial, "exec-out", "sh", "-c",
+      "while true; do screencap -p; done",
+    ]
+    process.standardOutput = outputPipe
+    process.standardError = FileHandle.nullDevice
+    parser.reset()
+    activeLaunchID = launchID
+
+    outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      guard !data.isEmpty else {
+        handle.readabilityHandler = nil
+        return
+      }
+      self?.queue.async { [weak self] in
+        guard let self, activeLaunchID == launchID, !stopped else { return }
+        for png in parser.append(data) {
+          guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+            let frame = CGImageSourceCreateImageAtIndex(source, 0, nil)
+          else { continue }
+          onFrame(frame)
+        }
+      }
+    }
+    process.terminationHandler = { [weak self] _ in
+      self?.queue.async { [weak self] in
+        self?.processEnded(launchID: launchID)
+      }
+    }
+
+    self.process = process
+    self.outputPipe = outputPipe
+    do {
+      try process.run()
+    } catch {
+      self.process = nil
+      self.outputPipe = nil
+      activeLaunchID = nil
+      throw MirrorPhoneError.processFailed(
+        "Could not start Android framebuffer capture: \(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func processEnded(launchID: UUID) {
+    guard activeLaunchID == launchID else { return }
+    activeLaunchID = nil
+    outputPipe?.fileHandleForReading.readabilityHandler = nil
+    outputPipe = nil
+    process = nil
+    parser.reset()
+    guard !stopped else { return }
+
+    onStatus("Refreshing the Android framebuffer connection")
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self, !stopped, process == nil else { return }
+      reconnectWorkItem = nil
+      do {
+        try launch()
+      } catch {
+        onStatus(error.localizedDescription)
+      }
+    }
+    reconnectWorkItem = workItem
+    queue.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+  }
+}
+
+struct PNGStreamParser: Sendable {
+  private static let signature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+  private static let iend = Data("IEND".utf8)
+  private static let maximumChunkSize = 64 * 1_024 * 1_024
+  private var buffer = Data()
+
+  mutating func append(_ data: Data) -> [Data] {
+    buffer.append(data)
+    var images = [Data]()
+
+    while true {
+      guard alignToSignature() else { break }
+      var offset = Self.signature.count
+      var completeLength: Int?
+
+      while buffer.count >= offset + 12 {
+        let chunkLength = Int(readUInt32(at: offset))
+        guard chunkLength <= Self.maximumChunkSize else {
+          buffer = Data(buffer.dropFirst())
+          break
+        }
+        let totalLength = 12 + chunkLength
+        guard buffer.count >= offset + totalLength else { break }
+        let type = buffer[(offset + 4)..<(offset + 8)]
+        offset += totalLength
+        if type.elementsEqual(Self.iend) {
+          completeLength = offset
+          break
+        }
+      }
+
+      guard let completeLength else { break }
+      images.append(Data(buffer.prefix(completeLength)))
+      buffer = Data(buffer.dropFirst(completeLength))
+    }
+    return images
+  }
+
+  mutating func reset() {
+    buffer.removeAll(keepingCapacity: true)
+  }
+
+  private mutating func alignToSignature() -> Bool {
+    if buffer.starts(with: Self.signature) { return true }
+    if let range = buffer.range(of: Self.signature) {
+      buffer = Data(buffer[range.lowerBound...])
+      return true
+    }
+    if buffer.count > Self.signature.count - 1 {
+      buffer = Data(buffer.suffix(Self.signature.count - 1))
+    }
+    return false
+  }
+
+  private func readUInt32(at offset: Int) -> UInt32 {
+    buffer[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
   }
 }
 
@@ -664,10 +985,13 @@ private final class AndroidH264StreamDecoder: @unchecked Sendable {
     self.onStatus = onStatus
   }
 
-  func consume(_ data: Data) {
-    for nalUnit in parser.append(data) {
+  @discardableResult
+  func consume(_ data: Data) -> Bool {
+    let nalUnits = parser.append(data)
+    for nalUnit in nalUnits {
       consumeNALUnit(nalUnit)
     }
+    return !nalUnits.isEmpty
   }
 
   func finish() {
