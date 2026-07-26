@@ -21,7 +21,7 @@ ICON_FILE="$ROOT/Resources/MirrorPhone.icns"
 DMG_BACKGROUND="$ROOT/Resources/DMGBackground.png"
 TEAM_ID="${MIRRORPHONE_TEAM_ID:-}"
 NOTARY_PROFILE="${MIRRORPHONE_NOTARY_PROFILE:-}"
-SIGNING_IDENTITY="${MIRRORPHONE_SIGNING_IDENTITY:-}"
+SIGNING_IDENTITY="${MIRRORPHONE_SIGNING_IDENTITY:-${DEVELOPER_ID_APPLICATION:-}}"
 SKIP_NOTARIZATION="${MIRRORPHONE_SKIP_NOTARIZATION:-0}"
 VOLUME_NAME="$APP_NAME Installer"
 DIST_DIR="$ROOT/dist"
@@ -58,7 +58,8 @@ fi
 
 if [[ -z "$SIGNING_IDENTITY" ]]; then
   [[ -n "$TEAM_ID" ]] || fail \
-    "MIRRORPHONE_TEAM_ID is required when MIRRORPHONE_SIGNING_IDENTITY is not set"
+    "set DEVELOPER_ID_APPLICATION (or MIRRORPHONE_SIGNING_IDENTITY) to a Developer ID" \
+    "Application identity, or MIRRORPHONE_TEAM_ID to look one up in Keychain"
   SIGNING_IDENTITY="$({ security find-identity -v -p codesigning 2>/dev/null || true; } \
     | sed -n "s/.*\"\(Developer ID Application:.*($TEAM_ID)\)\".*/\1/p" \
     | head -n 1)"
