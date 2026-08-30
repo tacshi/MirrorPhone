@@ -3,7 +3,7 @@ import AVFoundation
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-  private var windowController: MirrorWindowController?
+  private var windowCoordinator: MirrorWindowCoordinator?
   private var terminationTask: Task<Void, Never>?
 
   func applicationWillFinishLaunching(_ notification: Notification) {
@@ -11,12 +11,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    let controller = MirrorWindowController()
-    windowController = controller
     configureMainMenu()
-    controller.showWindow(nil)
+    let coordinator = MirrorWindowCoordinator()
+    windowCoordinator = coordinator
+    coordinator.start()
     NSApp.activate(ignoringOtherApps: true)
     registerCameraPermission()
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    windowCoordinator?.stop()
   }
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -24,12 +28,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    guard let windowController, windowController.hasRecordingToFinalize else {
+    guard let windowCoordinator, windowCoordinator.hasRecordingsToFinalize else {
       return .terminateNow
     }
     guard terminationTask == nil else { return .terminateLater }
     terminationTask = Task { @MainActor [weak self, weak sender] in
-      let succeeded = await windowController.finalizeRecordingForTermination()
+      let succeeded = await windowCoordinator.finalizeRecordingsForTermination()
       self?.terminationTask = nil
       sender?.reply(toApplicationShouldTerminate: succeeded)
     }
@@ -41,6 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task {
       _ = await AVCaptureDevice.requestAccess(for: .video)
     }
+  }
+
+  @objc private func newWindow(_ sender: Any?) {
+    windowCoordinator?.openWindow(sender)
   }
 
   private func configureMainMenu() {
@@ -62,29 +70,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     appMenuItem.submenu = appMenu
 
+    let fileMenuItem = NSMenuItem()
+    mainMenu.addItem(fileMenuItem)
+    let fileMenu = NSMenu(title: "File")
+    let newWindowItem = fileMenu.addItem(
+      withTitle: "New Window",
+      action: #selector(newWindow(_:)),
+      keyEquivalent: "n"
+    )
+    newWindowItem.target = self
+    fileMenu.addItem(.separator())
+    let recordingItem = fileMenu.addItem(
+      withTitle: "Start Recording…",
+      action: #selector(MirrorWindowController.toggleRecording(_:)),
+      keyEquivalent: "r"
+    )
+    recordingItem.target = nil
+    let captureItem = fileMenu.addItem(
+      withTitle: "Capture Image", action: #selector(MirrorWindowController.captureImage(_:)),
+      keyEquivalent: "s")
+    captureItem.target = nil
+    fileMenuItem.submenu = fileMenu
+
     let viewMenuItem = NSMenuItem()
     mainMenu.addItem(viewMenuItem)
     let viewMenu = NSMenu(title: "View")
     let actualSizeItem = viewMenu.addItem(
       withTitle: "Actual Size", action: #selector(MirrorWindowController.actualSize(_:)),
       keyEquivalent: "0")
-    actualSizeItem.target = windowController
+    actualSizeItem.target = nil
     viewMenuItem.submenu = viewMenu
 
-    let fileMenuItem = NSMenuItem()
-    mainMenu.addItem(fileMenuItem)
-    let fileMenu = NSMenu(title: "File")
-    let recordingItem = fileMenu.addItem(
-      withTitle: "Start Recording…",
-      action: #selector(MirrorWindowController.toggleRecording(_:)),
-      keyEquivalent: "r"
+    let windowMenuItem = NSMenuItem()
+    mainMenu.addItem(windowMenuItem)
+    let windowMenu = NSMenu(title: "Window")
+    let minimizeItem = windowMenu.addItem(
+      withTitle: "Minimize",
+      action: #selector(NSWindow.performMiniaturize(_:)),
+      keyEquivalent: "m"
     )
-    recordingItem.target = windowController
-    let captureItem = fileMenu.addItem(
-      withTitle: "Capture Image", action: #selector(MirrorWindowController.captureImage(_:)),
-      keyEquivalent: "s")
-    captureItem.target = windowController
-    fileMenuItem.submenu = fileMenu
+    minimizeItem.target = nil
+    let zoomItem = windowMenu.addItem(
+      withTitle: "Zoom",
+      action: #selector(NSWindow.performZoom(_:)),
+      keyEquivalent: ""
+    )
+    zoomItem.target = nil
+    windowMenu.addItem(.separator())
+    let frontItem = windowMenu.addItem(
+      withTitle: "Bring All to Front",
+      action: #selector(NSApplication.arrangeInFront(_:)),
+      keyEquivalent: ""
+    )
+    frontItem.target = NSApp
+    windowMenuItem.submenu = windowMenu
+    NSApp.windowsMenu = windowMenu
 
     NSApp.mainMenu = mainMenu
   }

@@ -310,6 +310,15 @@ final class MirrorView: NSView {
     needsDisplay = true
   }
 
+  func showDisconnected(deviceName: String) {
+    displayedFrame = nil
+    tutorial.isHidden = true
+    loadingLabel.stringValue = "Waiting for \(deviceName) to reconnect"
+    loading.isHidden = false
+    loadingIndicator.stopAnimation(nil)
+    needsDisplay = true
+  }
+
   func clear() {
     displayedFrame = nil
     tutorial.isHidden = false

@@ -22,14 +22,16 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   private let actualSizeButton = NSButton()
   private let captureButton = NSButton()
   private let recordButton = NSButton()
-  private var devices = [MirrorDevice]()
-  private var selectedDeviceID: String?
+  private var assignment = MirrorWindowAssignment.empty
+  private var receivesCoordinatedAssignments = false
+  private var sourceFactory: any MirrorSourceCreating = DefaultMirrorSourceFactory()
   private var source: (any MirrorSource)?
-  private var deviceDiscovery: DeviceDiscovery?
+  private var sourceDeviceID: String?
   private var connectionTask: Task<Void, Never>?
+  private var disconnectionTask: Task<Void, Never>?
+  private var restartTask: Task<Void, Never>?
   private var connectionGeneration = 0
   private var retryCaptureWhenActive = false
-  private var activeDeviceName: String?
   private var receivedFirstFrame = false
   private var reportedFrameSize: CGSize?
   private var mirrorAspectRatio: CGFloat?
@@ -47,13 +49,22 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   private var recordingFinishTask: Task<Bool, Never>?
   private var recordingStatusDismissTask: Task<Void, Never>?
   private var savePanelOpen = false
-  private var sourceActionAfterRecording: (() -> Void)?
-  private var sourceActionFinalizationTask: Task<Void, Never>?
+  private var isPreparingDeviceSwitch = false
+  private var isPreparingToClose = false
   private var closeRequested = false
   private var allowWindowClose = false
   private var recordingGeneration = 0
 
+  var onDeviceSelectionRequested: ((String) -> Void)?
+  var onWindowCloseRequested: (() -> Void)?
+  var onWindowClosed: (() -> Void)?
+  var onIOSCaptureLive: ((String) -> Void)?
+
   convenience init() {
+    self.init(sourceFactory: DefaultMirrorSourceFactory())
+  }
+
+  convenience init(sourceFactory: any MirrorSourceCreating) {
     let window = NSWindow(
       contentRect: NSRect(origin: .zero, size: Self.defaultContentSize),
       styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -61,12 +72,15 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       defer: false
     )
     self.init(window: window)
+    self.sourceFactory = sourceFactory
     configureWindow()
   }
 
   override func showWindow(_ sender: Any?) {
     super.showWindow(sender)
-    startAutomaticDetection()
+    if assignment.selectedDevice == nil || !assignment.isSelectedDeviceConnected {
+      setTitlebarVisible(true)
+    }
     startTitlebarPointerMonitor()
   }
 
@@ -194,98 +208,121 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     button.translatesAutoresizingMaskIntoConstraints = false
   }
 
-  private func startAutomaticDetection() {
-    deviceDiscovery?.stop()
-    setStatus(Self.waitingStatus)
-    let deviceDiscovery = DeviceDiscovery()
-    deviceDiscovery.onDevicesChanged = { [weak self] devices in
-      self?.updateDevices(devices)
-    }
-    deviceDiscovery.onIOSCaptureDeviceReady = { [weak self] in
-      self?.restartSelectedIOSCapture()
-    }
-    self.deviceDiscovery = deviceDiscovery
-    setTitlebarVisible(true)
-    deviceDiscovery.start()
-  }
-
   @objc private func deviceSelectionChanged(_ sender: Any?) {
-    let index = devicePopup.indexOfSelectedItem
-    guard devices.indices.contains(index) else { return }
-    let device = devices[index]
-    selectedDeviceID = device.id
-    connect(to: device)
+    guard let deviceID = devicePopup.selectedItem?.representedObject as? String,
+      deviceID != assignment.selectedDeviceID
+    else {
+      updateDeviceMenu()
+      return
+    }
+    onDeviceSelectionRequested?(deviceID)
   }
 
-  private func updateDevices(_ discoveredDevices: [MirrorDevice]) {
-    let previousDevices = devices
-    let previousSelection = selectedDeviceID
-    devices = discoveredDevices
+  func apply(assignment newAssignment: MirrorWindowAssignment) {
+    let previousAssignment = assignment
+    receivesCoordinatedAssignments = true
+    assignment = newAssignment
+    updateDeviceMenu()
+    updateWindowTitle()
+    updateRecordingAction()
 
-    let selectedDevice = previousSelection.flatMap { id in
-      devices.first { $0.id == id }
-    } ?? devices.first
-    selectedDeviceID = selectedDevice?.id
-
-    if previousDevices != devices || previousSelection != selectedDeviceID {
-      updateDeviceMenu()
+    if newAssignment.selectedDevice == nil || !newAssignment.isSelectedDeviceConnected {
+      setTitlebarVisible(true)
     }
 
-    guard let selectedDevice else {
-      if previousSelection != nil || source != nil || connectionTask != nil {
-        stopConnection()
-      }
-      activeDeviceName = nil
-      receivedFirstFrame = false
-      reportedFrameSize = nil
-      showDefaultScreen()
-      setStatus(Self.waitingStatus)
-      setTitlebarVisible(true)
+    guard !newAssignment.isTransitioning, !isPreparingDeviceSwitch, !isPreparingToClose else {
       return
     }
 
-    if previousSelection != selectedDevice.id {
+    guard let selectedDevice = newAssignment.selectedDevice else {
+      if previousAssignment.selectedDevice != nil || source != nil || connectionTask != nil {
+        disconnectSelectedDevice(showDisconnectedReservation: false)
+      } else {
+        showDefaultScreen()
+      }
+      return
+    }
+
+    guard newAssignment.isSelectedDeviceConnected else {
+      if previousAssignment.isSelectedDeviceConnected || source != nil || connectionTask != nil {
+        disconnectSelectedDevice(showDisconnectedReservation: true)
+      } else if disconnectionTask == nil {
+        showDisconnectedScreen(deviceName: selectedDevice.name)
+      }
+      return
+    }
+
+    disconnectionTask?.cancel()
+    if sourceDeviceID != selectedDevice.id && connectionTask == nil
+      && disconnectionTask == nil && restartTask == nil
+    {
       connect(to: selectedDevice)
     }
   }
 
   private func updateDeviceMenu() {
     devicePopup.removeAllItems()
-    guard !devices.isEmpty else {
+    if assignment.selectedDevice == nil {
       devicePopup.addItem(withTitle: "No device")
-      devicePopup.isEnabled = false
-      return
+      devicePopup.lastItem?.isEnabled = false
     }
 
-    for device in devices {
-      devicePopup.addItem(withTitle: device.name)
+    for option in assignment.options {
+      let suffix: String
+      switch option.state {
+      case .selected, .available:
+        suffix = ""
+      case .inAnotherWindow:
+        suffix = " — In Another Window"
+      case .disconnected:
+        suffix = " — Disconnected"
+      case .switching:
+        suffix = " — Switching…"
+      }
+      devicePopup.addItem(withTitle: option.device.name + suffix)
+      guard let item = devicePopup.lastItem else { continue }
+      item.representedObject = option.device.id
+      item.isEnabled = option.state == .available
     }
-    devicePopup.isEnabled = devices.count > 1
-    if let selectedDeviceID,
-      let index = devices.firstIndex(where: { $0.id == selectedDeviceID })
+
+    devicePopup.isEnabled = !assignment.isTransitioning && !assignment.options.isEmpty
+    if let selectedDeviceID = assignment.selectedDeviceID,
+      let selectedItem = devicePopup.itemArray.first(where: {
+        ($0.representedObject as? String) == selectedDeviceID
+      })
     {
-      devicePopup.selectItem(at: index)
-    } else {
+      devicePopup.select(selectedItem)
+    } else if assignment.selectedDevice == nil {
       devicePopup.selectItem(at: 0)
     }
   }
 
-  private func connect(to device: MirrorDevice, preserveFrame: Bool = false) {
-    if hasRecordingToFinalize {
-      performAfterRecordingFinalizes { [weak self] in
-        self?.connect(to: device, preserveFrame: preserveFrame)
-      }
-      return
+  private func updateWindowTitle() {
+    if let device = assignment.selectedDevice {
+      window?.title = "MirrorPhone — \(device.name)"
+    } else {
+      window?.title = "MirrorPhone"
     }
+  }
+
+  private func connect(to device: MirrorDevice, preserveFrame: Bool = false) {
+    guard assignment.selectedDeviceID == device.id,
+      assignment.isSelectedDeviceConnected,
+      !assignment.isTransitioning,
+      !isPreparingDeviceSwitch,
+      !isPreparingToClose
+    else { return }
+
     connectionGeneration += 1
     let generation = connectionGeneration
-    connectionTask?.cancel()
+    let priorConnectionTask = connectionTask
+    priorConnectionTask?.cancel()
     let previousSource = source
     source = nil
+    sourceDeviceID = nil
     updateRecordingAction()
     mirrorView.resetInputState()
     mirrorView.onInput = nil
-    activeDeviceName = device.name
     receivedFirstFrame = false
     reportedFrameSize = nil
     if !preserveFrame {
@@ -293,64 +330,38 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     }
     setStatus("Connecting to \(device.name) by USB")
 
-    connectionTask = Task { [weak self] in
+    connectionTask = Task { @MainActor [weak self] in
+      await priorConnectionTask?.value
       await previousSource?.stop()
       guard let self, !Task.isCancelled,
         connectionGeneration == generation,
-        selectedDeviceID == device.id
+        assignment.selectedDeviceID == device.id,
+        assignment.isSelectedDeviceConnected
       else { return }
 
-      let newSource = device.makeSource()
-      newSource.onFrame = { [weak self] frame in
-        guard let self, selectedDeviceID == device.id else { return }
-        mirrorView.show(frame: frame)
-        fitWindowToDisplayedFrameIfNeeded()
-        let frameSize = CGSize(width: frame.width, height: frame.height)
-        if !receivedFirstFrame || reportedFrameSize != frameSize {
-          if !receivedFirstFrame, case .iosScreen = device.kind {
-            deviceDiscovery?.markIOSCaptureLive()
-          }
-          receivedFirstFrame = true
-          reportedFrameSize = frameSize
-          updateRecordingAction()
-          setStatus("Live · \(device.name) · \(frame.width) × \(frame.height)")
-        }
-      }
-      newSource.onStatus = { [weak self] message in
-        guard let self, selectedDeviceID == device.id else { return }
-        setStatus(message)
-      }
-      // Forward semantic input to sources that accept it; view-only sources
-      // return a nil sink and normal responder handling remains active.
-      if let sink = newSource.inputSink {
-        mirrorView.onInput = { [weak sink] event in
-          sink?.send(event)
-        }
-        window?.makeFirstResponder(mirrorView)
-      } else {
-        mirrorView.onInput = nil
-      }
-      if let android = newSource as? AndroidADBMirrorSource {
-        android.onInputInterrupted = { [weak self] in
-          self?.mirrorView.resetInputState()
-        }
-      }
-      source = newSource
-      updateRecordingAction()
+      let newSource = sourceFactory.makeSource(for: device)
+      configure(source: newSource, for: device)
 
       do {
         try await newSource.start()
         guard !Task.isCancelled,
           connectionGeneration == generation,
-          selectedDeviceID == device.id
+          assignment.selectedDeviceID == device.id,
+          assignment.isSelectedDeviceConnected
         else {
           await newSource.stop()
+          if connectionGeneration == generation {
+            source = nil
+            sourceDeviceID = nil
+            updateRecordingAction()
+          }
           return
         }
       } catch {
         await newSource.stop()
         if connectionGeneration == generation {
           source = nil
+          sourceDeviceID = nil
           updateRecordingAction()
           setStatus(error.localizedDescription)
           present(error: error)
@@ -362,35 +373,245 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     }
   }
 
-  private func stopConnection() {
-    if hasRecordingToFinalize {
-      performAfterRecordingFinalizes { [weak self] in
-        self?.stopConnection()
+  private func configure(source newSource: any MirrorSource, for device: MirrorDevice) {
+    newSource.onFrame = { [weak self] frame in
+      guard let self, sourceDeviceID == device.id,
+        assignment.selectedDeviceID == device.id || isPreparingDeviceSwitch
+      else { return }
+      mirrorView.show(frame: frame)
+      fitWindowToDisplayedFrameIfNeeded()
+      let frameSize = CGSize(width: frame.width, height: frame.height)
+      if !receivedFirstFrame || reportedFrameSize != frameSize {
+        if !receivedFirstFrame, case .iosScreen = device.kind {
+          onIOSCaptureLive?(device.id)
+        }
+        receivedFirstFrame = true
+        reportedFrameSize = frameSize
+        updateRecordingAction()
+        setStatus("Live · \(device.name) · \(frame.width) × \(frame.height)")
       }
-      return
     }
+    newSource.onStatus = { [weak self] message in
+      guard let self, sourceDeviceID == device.id else { return }
+      setStatus(message)
+    }
+    // Forward semantic input to sources that accept it; view-only sources
+    // return a nil sink and normal responder handling remains active.
+    if let sink = newSource.inputSink {
+      mirrorView.onInput = { [weak sink] event in
+        sink?.send(event)
+      }
+      window?.makeFirstResponder(mirrorView)
+    } else {
+      mirrorView.onInput = nil
+    }
+    if let android = newSource as? AndroidADBMirrorSource {
+      android.onInputInterrupted = { [weak self] in
+        self?.mirrorView.resetInputState()
+      }
+    }
+    source = newSource
+    sourceDeviceID = device.id
+    updateRecordingAction()
+  }
+
+  private func stopConnectionImmediately(clearFrame: Bool) async {
     connectionGeneration += 1
     let generation = connectionGeneration
-    connectionTask?.cancel()
+    let priorConnectionTask = connectionTask
+    connectionTask = nil
+    priorConnectionTask?.cancel()
+    await priorConnectionTask?.value
+    guard connectionGeneration == generation else { return }
+
     mirrorView.resetInputState()
     mirrorView.onInput = nil
     let previousSource = source
     source = nil
+    sourceDeviceID = nil
     updateRecordingAction()
-    connectionTask = Task { [weak self] in
-      await previousSource?.stop()
-      guard let self, connectionGeneration == generation else { return }
-      connectionTask = nil
+    await previousSource?.stop()
+    guard connectionGeneration == generation else { return }
+    if clearFrame {
+      showDefaultScreen()
     }
+  }
+
+  private func disconnectSelectedDevice(showDisconnectedReservation: Bool) {
+    guard disconnectionTask == nil else { return }
+    let pendingRestart = restartTask
+    pendingRestart?.cancel()
+    disconnectionTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      await pendingRestart?.value
+      restartTask = nil
+      _ = await finishRecording()
+      guard !Task.isCancelled else {
+        disconnectionTask = nil
+        reconnectAssignedDeviceIfNeeded()
+        return
+      }
+      await stopConnectionImmediately(clearFrame: !showDisconnectedReservation)
+      guard !Task.isCancelled else {
+        disconnectionTask = nil
+        reconnectAssignedDeviceIfNeeded()
+        return
+      }
+
+      if showDisconnectedReservation,
+        let selectedDevice = assignment.selectedDevice,
+        !assignment.isSelectedDeviceConnected
+      {
+        showDisconnectedScreen(deviceName: selectedDevice.name)
+      }
+      disconnectionTask = nil
+      reconnectAssignedDeviceIfNeeded()
+    }
+  }
+
+  func prepareForDeviceSwitch() async -> Bool {
+    guard !isPreparingDeviceSwitch, !isPreparingToClose else { return false }
+    isPreparingDeviceSwitch = true
+    updateRecordingAction()
+    defer {
+      isPreparingDeviceSwitch = false
+      updateRecordingAction()
+    }
+
+    await cancelPendingSourceTransitions()
+    guard await finishRecording(), !Task.isCancelled, !isPreparingToClose else {
+      return false
+    }
+    await stopConnectionImmediately(clearFrame: false)
+    return !Task.isCancelled && !isPreparingToClose
+  }
+
+  func prepareForDeviceSwitch(to targetDevice: MirrorDevice) async -> Bool {
+    guard !isPreparingDeviceSwitch, !isPreparingToClose else { return false }
+    isPreparingDeviceSwitch = true
+    updateRecordingAction()
+    defer {
+      isPreparingDeviceSwitch = false
+      updateRecordingAction()
+    }
+
+    await cancelPendingSourceTransitions()
+    guard await finishRecording(), !Task.isCancelled, !isPreparingToClose else {
+      return false
+    }
+    await stopConnectionImmediately(clearFrame: false)
+    guard !Task.isCancelled, !isPreparingToClose,
+      assignment.pendingDeviceID == targetDevice.id
+    else { return false }
+    return await startPreparedSwitchSource(for: targetDevice)
+  }
+
+  private func startPreparedSwitchSource(for device: MirrorDevice) async -> Bool {
+    connectionGeneration += 1
+    let generation = connectionGeneration
+    receivedFirstFrame = false
+    reportedFrameSize = nil
+    mirrorView.resetInputState()
+    mirrorView.onInput = nil
+    mirrorView.showLoading(deviceName: device.name)
+    setStatus("Connecting to \(device.name) by USB")
+
+    let newSource = sourceFactory.makeSource(for: device)
+    configure(source: newSource, for: device)
+    do {
+      try await newSource.start()
+      guard !Task.isCancelled, !isPreparingToClose,
+        connectionGeneration == generation,
+        assignment.pendingDeviceID == device.id
+      else {
+        await newSource.stop()
+        if connectionGeneration == generation, sourceDeviceID == device.id {
+          source = nil
+          sourceDeviceID = nil
+          updateRecordingAction()
+        }
+        return false
+      }
+      return true
+    } catch {
+      await newSource.stop()
+      if connectionGeneration == generation, sourceDeviceID == device.id {
+        source = nil
+        sourceDeviceID = nil
+        updateRecordingAction()
+        setStatus(error.localizedDescription)
+        present(error: error)
+      }
+      return false
+    }
+  }
+
+  func restartIOSCapture(deviceID: String) {
+    guard assignment.selectedDeviceID == deviceID,
+      assignment.isSelectedDeviceConnected,
+      !assignment.isTransitioning,
+      !isPreparingDeviceSwitch,
+      !isPreparingToClose,
+      disconnectionTask == nil,
+      restartTask == nil
+    else { return }
+
+    restartTask = Task { @MainActor [weak self] in
+      guard let self, await finishRecording(), !Task.isCancelled else {
+        self?.restartTask = nil
+        self?.reconnectAssignedDeviceIfNeeded()
+        return
+      }
+      await stopConnectionImmediately(clearFrame: false)
+      restartTask = nil
+      guard !Task.isCancelled,
+        assignment.selectedDeviceID == deviceID,
+        let device = assignment.selectedDevice
+      else { return }
+      guard assignment.isSelectedDeviceConnected else {
+        showDisconnectedScreen(deviceName: device.name)
+        return
+      }
+      connect(to: device, preserveFrame: true)
+    }
+  }
+
+  private func cancelPendingSourceTransitions() async {
+    let pendingDisconnection = disconnectionTask
+    let pendingRestart = restartTask
+    pendingDisconnection?.cancel()
+    pendingRestart?.cancel()
+    await pendingDisconnection?.value
+    await pendingRestart?.value
+    disconnectionTask = nil
+    restartTask = nil
+  }
+
+  private func reconnectAssignedDeviceIfNeeded() {
+    guard disconnectionTask == nil, restartTask == nil, connectionTask == nil,
+      sourceDeviceID == nil,
+      !assignment.isTransitioning, !isPreparingDeviceSwitch, !isPreparingToClose,
+      assignment.isSelectedDeviceConnected, let device = assignment.selectedDevice
+    else { return }
+    connect(to: device)
   }
 
   private func showDefaultScreen() {
     rememberCurrentViewerSize()
-    activeDeviceName = nil
     receivedFirstFrame = false
     reportedFrameSize = nil
     mirrorAspectRatio = nil
     mirrorView.clear()
+    updateRecordingAction()
+    restorePortraitWindow()
+  }
+
+  private func showDisconnectedScreen(deviceName: String) {
+    rememberCurrentViewerSize()
+    receivedFirstFrame = false
+    reportedFrameSize = nil
+    mirrorAspectRatio = nil
+    mirrorView.showDisconnected(deviceName: deviceName)
     updateRecordingAction()
     restorePortraitWindow()
   }
@@ -499,6 +720,9 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       return
     }
     guard !savePanelOpen,
+      !assignment.isTransitioning,
+      !isPreparingDeviceSwitch,
+      !isPreparingToClose,
       mirrorView.displayedFrame != nil,
       source is any RecordableMirrorSource,
       let window
@@ -642,6 +866,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     let isFinishing = finishing || recordingFinishTask != nil
     let canStart =
       mirrorView.displayedFrame != nil && source is any RecordableMirrorSource && !savePanelOpen
+      && !assignment.isTransitioning && !isPreparingDeviceSwitch && !isPreparingToClose
     recordButton.isEnabled = !isFinishing && (isRecording || canStart)
     let title: String
     let symbol: String
@@ -673,6 +898,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       }
       menuItem.title = "Start Recording…"
       return mirrorView.displayedFrame != nil && source is any RecordableMirrorSource && !savePanelOpen
+        && !assignment.isTransitioning && !isPreparingDeviceSwitch && !isPreparingToClose
     }
     if menuItem.action == #selector(captureImage(_:)) {
       return mirrorView.displayedFrame != nil
@@ -685,34 +911,25 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   func finalizeRecordingForTermination() async -> Bool {
-    sourceActionAfterRecording = nil
-    sourceActionFinalizationTask?.cancel()
     return await finishRecording()
   }
 
-  private func performAfterRecordingFinalizes(_ action: @escaping () -> Void) {
-    sourceActionAfterRecording = action
-    guard sourceActionFinalizationTask == nil else { return }
-    sourceActionFinalizationTask = Task { @MainActor [weak self] in
-      guard let self else { return }
-      _ = await finishRecording()
-      let action = sourceActionAfterRecording
-      sourceActionAfterRecording = nil
-      sourceActionFinalizationTask = nil
-      guard !Task.isCancelled else { return }
-      action?()
-    }
-  }
-
   func windowShouldClose(_ sender: NSWindow) -> Bool {
-    if allowWindowClose || !hasRecordingToFinalize { return true }
+    if allowWindowClose { return true }
     guard !closeRequested else { return false }
     closeRequested = true
-    sourceActionAfterRecording = nil
-    sourceActionFinalizationTask?.cancel()
+    isPreparingToClose = true
+    updateRecordingAction()
+    onWindowCloseRequested?()
     Task { @MainActor [weak self, weak sender] in
       guard let self else { return }
+      await cancelPendingSourceTransitions()
       let succeeded = await finishRecording()
+      if succeeded {
+        await stopConnectionImmediately(clearFrame: false)
+      }
+      isPreparingToClose = false
+      updateRecordingAction()
       closeRequested = false
       guard succeeded, let sender else { return }
       allowWindowClose = true
@@ -724,14 +941,22 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   func windowWillClose(_ notification: Notification) {
     titlebarMonitorTask?.cancel()
     titlebarMonitorTask = nil
-    deviceDiscovery?.stop()
-    deviceDiscovery = nil
+    disconnectionTask?.cancel()
+    restartTask?.cancel()
     connectionTask?.cancel()
     recordingTimerTask?.cancel()
     recordingStatusDismissTask?.cancel()
-    Task { [source] in
-      await source?.stop()
+    let remainingSource = source
+    source = nil
+    sourceDeviceID = nil
+    Task { [remainingSource] in
+      await remainingSource?.stop()
     }
+    onWindowClosed?()
+    onWindowClosed = nil
+    onWindowCloseRequested = nil
+    onDeviceSelectionRequested = nil
+    onIOSCaptureLive = nil
   }
 
   private func presentRecordingFailure(_ error: Error, destinationURL: URL) {
@@ -841,7 +1066,8 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   private var shouldKeepTitlebarVisible: Bool {
-    deviceDiscovery != nil && devices.isEmpty
+    receivesCoordinatedAssignments
+      && (assignment.selectedDevice == nil || !assignment.isSelectedDeviceConnected)
   }
 
   /// Grows the window upward (or collapses it back) by the titlebar height while
@@ -1040,18 +1266,11 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   private func retrySelectedDevice() {
-    guard source == nil, connectionTask == nil, let selectedDeviceID,
-      let device = devices.first(where: { $0.id == selectedDeviceID })
+    guard source == nil, connectionTask == nil,
+      assignment.isSelectedDeviceConnected,
+      let device = assignment.selectedDevice
     else { return }
     connect(to: device)
-  }
-
-  private func restartSelectedIOSCapture() {
-    guard let selectedDeviceID,
-      let device = devices.first(where: { $0.id == selectedDeviceID }),
-      case .iosScreen = device.kind
-    else { return }
-    connect(to: device, preserveFrame: true)
   }
 
   private static let filenameDateFormatter: DateFormatter = {
@@ -1060,10 +1279,4 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     return formatter
   }()
 
-  private static var waitingStatus: String {
-    if AndroidADB.executableURL == nil {
-      return "Connect an iPhone/iPad by USB · Android transport unavailable"
-    }
-    return "Connect and unlock a phone by USB"
-  }
 }

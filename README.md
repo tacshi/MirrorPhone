@@ -22,6 +22,7 @@ iOS and iPadOS do not expose a public system-wide input-injection API comparable
 ## Features
 
 - Automatic discovery of connected iPhone, iPad, and Android devices
+- Multiple independent device windows with one exclusive window per physical device
 - Low-latency native video decoding and orientation changes
 - iPhone and iPad audio through the USB capture stream
 - Android taps, drags, scrolling, text entry, navigation keys, and keyboard shortcuts
@@ -73,6 +74,10 @@ swift test
 
 ## Connect a device
 
+MirrorPhone opens one window at launch. Choose **File > New Window** or press <kbd>Command</kbd> + <kbd>N</kbd> to mirror another connected device. A new window claims the first connected device that is not already in use; if none is available, it waits until one connects. Attaching a device never creates an extra window by itself.
+
+Each physical device belongs to one window at a time. Devices claimed by other windows remain listed as **In Another Window** but cannot be selected. If a device disconnects, its window keeps the reservation and reconnects automatically when that same device returns. Closing the window releases the claim. Capture, input, resizing, and MP4 recording remain independent, so different windows can record simultaneously.
+
 ### iPhone or iPad
 
 1. Connect the unlocked device by USB.
@@ -104,6 +109,7 @@ Device audio is recorded when the source exposes it. Microphone denial on iPhone
 
 | Shortcut | Action |
 | --- | --- |
+| <kbd>Command</kbd> + <kbd>N</kbd> | Open a new device window |
 | <kbd>Command</kbd> + <kbd>0</kbd> | Show the current frame at actual size |
 | <kbd>Command</kbd> + <kbd>R</kbd> | Start or stop an MP4 recording |
 | <kbd>Command</kbd> + <kbd>S</kbd> | Save the current frame as a PNG |
