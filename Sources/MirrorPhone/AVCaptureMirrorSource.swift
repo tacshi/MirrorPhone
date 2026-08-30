@@ -2,13 +2,69 @@
 import AppKit
 import CoreImage
 
+struct AVCaptureQualityPresetChoice: Equatable, Sendable {
+  let level: MirrorQualityLevel
+  let preset: AVCaptureSession.Preset
+}
+
+enum AVCaptureQualityPresetResolver {
+  static let candidates: [MirrorQualityLevel: [AVCaptureSession.Preset]] = [
+    .quality: [.high],
+    .balanced: [.hd1920x1080, .medium],
+    .performance: [.hd1280x720, .low],
+  ]
+
+  static func supportedLevels(
+    in presets: Set<AVCaptureSession.Preset>
+  ) -> Set<MirrorQualityLevel> {
+    Set(candidates.compactMap { level, candidates in
+      candidates.contains(where: presets.contains) ? level : nil
+    })
+  }
+
+  static func resolve(
+    _ requested: MirrorQualityLevel,
+    supportedPresets: Set<AVCaptureSession.Preset>
+  ) -> AVCaptureQualityPresetChoice? {
+    let fallbackOrder: [MirrorQualityLevel]
+    switch requested {
+    case .quality:
+      fallbackOrder = [.quality, .balanced, .performance]
+    case .balanced:
+      fallbackOrder = [.balanced, .performance, .quality]
+    case .performance:
+      fallbackOrder = [.performance, .balanced, .quality]
+    }
+
+    for level in fallbackOrder {
+      for preset in candidates[level, default: []] where supportedPresets.contains(preset) {
+        return AVCaptureQualityPresetChoice(level: level, preset: preset)
+      }
+    }
+    return nil
+  }
+
+  static var allPresets: Set<AVCaptureSession.Preset> {
+    Set(candidates.values.flatMap { $0 })
+  }
+}
+
 @MainActor
-final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
+final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource, QualityAdjustableMirrorSource,
   AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate
 {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
   nonisolated let recordingTap = MirrorRecordingTap()
+  private let qualityController = MirrorQualityController()
+  var qualityState: MirrorQualityState { qualityController.state }
+  var onQualityStateChanged: ((MirrorQualityState) -> Void)? {
+    get { qualityController.onStateChanged }
+    set {
+      qualityController.onStateChanged = newValue
+      newValue?(qualityController.state)
+    }
+  }
 
   private let uniqueID: String
   private nonisolated let session = AVCaptureSession()
@@ -24,12 +80,27 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
   )
   private nonisolated let imageContext = CIContext(options: [.cacheIntermediates: false])
   private nonisolated let displayLock = NSLock()
+  private nonisolated let qualityApplyLock = NSLock()
   private nonisolated(unsafe) var pendingDisplayImage: CIImage?
   private nonisolated(unsafe) var displayScheduled = false
+  private nonisolated(unsafe) var latestQualityGeneration = 0
+  private nonisolated(unsafe) var pressureMeter: MirrorFramePressureMeter?
+  private var supportedQualityPresets = Set<AVCaptureSession.Preset>()
 
   init(uniqueID: String) {
     self.uniqueID = uniqueID
     super.init()
+    pressureMeter = MirrorFramePressureMeter { [weak self] window in
+      Task { @MainActor [weak self] in
+        guard let self, let level = qualityController.observe(window) else { return }
+        applyQualityLevel(level)
+      }
+    }
+  }
+
+  func setQualityMode(_ mode: MirrorQualityMode) {
+    guard let level = qualityController.setMode(mode) else { return }
+    applyQualityLevel(level)
   }
 
   func start() async throws {
@@ -84,7 +155,6 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
     audioDataOutput.setSampleBufferDelegate(self, queue: captureQueue)
 
     session.beginConfiguration()
-    session.sessionPreset = .high
     guard session.canAddInput(input), session.canAddOutput(output) else {
       session.commitConfiguration()
       throw MirrorPhoneError.sourceUnavailable("The wired video source could not be configured.")
@@ -106,7 +176,38 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
         .unavailable("This wired source does not expose recordable device audio.")
       )
     }
+
+    let supportedPresets = Set(
+      AVCaptureQualityPresetResolver.allPresets.filter { session.canSetSessionPreset($0) }
+    )
+    let supportedLevels = AVCaptureQualityPresetResolver.supportedLevels(in: supportedPresets)
+    guard !supportedLevels.isEmpty else {
+      session.commitConfiguration()
+      throw MirrorPhoneError.sourceUnavailable(
+        "The wired video source does not support a usable capture quality."
+      )
+    }
+    supportedQualityPresets = supportedPresets
+    _ = qualityController.setSupportedLevels(
+      supportedLevels,
+      limitation: qualityLimitation(supportedLevels: supportedLevels)
+    )
+    guard let effectiveLevel = qualityController.state.effectiveLevel,
+      let choice = AVCaptureQualityPresetResolver.resolve(
+        effectiveLevel,
+        supportedPresets: supportedPresets
+      )
+    else {
+      session.commitConfiguration()
+      throw MirrorPhoneError.sourceUnavailable(
+        "The wired video source does not support the selected capture quality."
+      )
+    }
+    session.sessionPreset = choice.preset
     session.commitConfiguration()
+    qualityController.markApplied(
+      limitation: qualityLimitation(supportedLevels: supportedLevels)
+    )
 
     let captureSession = session
     captureQueue.async {
@@ -125,6 +226,7 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
         continuation.resume()
       }
     }
+    pressureMeter?.reset()
   }
 
   nonisolated func captureOutput(
@@ -138,6 +240,7 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
       return
     }
     guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
+    pressureMeter?.recordSourceFrame()
     let image = CIImage(cvPixelBuffer: pixelBuffer)
     recordingTap.emit(
       video: MirrorVideoSample(
@@ -154,6 +257,9 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
     let alreadyScheduled = displayScheduled
     displayScheduled = true
     displayLock.unlock()
+    if alreadyScheduled {
+      pressureMeter?.recordDisplayReplacement()
+    }
     guard !alreadyScheduled else { return }
 
     displayQueue.async { [weak self] in
@@ -163,12 +269,100 @@ final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
       pendingDisplayImage = nil
       displayScheduled = false
       displayLock.unlock()
-      guard let image,
-        let frame = imageContext.createCGImage(image, from: image.extent)
-      else { return }
+      guard let image else { return }
+      let renderStartedAt = ProcessInfo.processInfo.systemUptime
+      guard let frame = imageContext.createCGImage(image, from: image.extent) else { return }
+      pressureMeter?.recordRender(
+        duration: ProcessInfo.processInfo.systemUptime - renderStartedAt
+      )
       Task { @MainActor [weak self] in
         self?.onFrame?(frame)
       }
     }
+  }
+
+  private func applyQualityLevel(_ level: MirrorQualityLevel) {
+    guard !supportedQualityPresets.isEmpty,
+      let choice = AVCaptureQualityPresetResolver.resolve(
+        level,
+        supportedPresets: supportedQualityPresets
+      )
+    else { return }
+
+    qualityApplyLock.lock()
+    latestQualityGeneration += 1
+    let generation = latestQualityGeneration
+    qualityApplyLock.unlock()
+
+    let captureSession = session
+    let qualityApplyLock = qualityApplyLock
+    captureQueue.async { [weak self] in
+      qualityApplyLock.lock()
+      let isLatest = self?.latestQualityGeneration == generation
+      qualityApplyLock.unlock()
+      guard isLatest else { return }
+
+      captureSession.beginConfiguration()
+      guard captureSession.canSetSessionPreset(choice.preset) else {
+        captureSession.commitConfiguration()
+        Task { @MainActor [weak self] in
+          guard let self else { return }
+          supportedQualityPresets.remove(choice.preset)
+          let levels = AVCaptureQualityPresetResolver.supportedLevels(
+            in: supportedQualityPresets
+          )
+          guard !levels.isEmpty else {
+            qualityController.markAdjustmentFailed(
+              "This wired source stopped supporting \(level.title)."
+            )
+            return
+          }
+          _ = qualityController.setSupportedLevels(
+            levels,
+            limitation: qualityLimitation(supportedLevels: levels)
+          )
+          if let fallback = qualityController.state.effectiveLevel {
+            applyQualityLevel(fallback)
+          } else {
+            qualityController.markApplied(
+              limitation: qualityLimitation(supportedLevels: levels)
+            )
+          }
+        }
+        return
+      }
+      captureSession.sessionPreset = choice.preset
+      captureSession.commitConfiguration()
+
+      qualityApplyLock.lock()
+      let remainedLatest = self?.latestQualityGeneration == generation
+      qualityApplyLock.unlock()
+      guard remainedLatest else { return }
+      self?.pressureMeter?.reset()
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        qualityController.markApplied(
+          limitation: qualityLimitation(
+            supportedLevels: AVCaptureQualityPresetResolver.supportedLevels(
+              in: supportedQualityPresets
+            )
+          )
+        )
+        onStatus?("Capture quality · \(choice.level.title)")
+      }
+    }
+  }
+
+  private func qualityLimitation(
+    supportedLevels: Set<MirrorQualityLevel>
+  ) -> String? {
+    guard supportedLevels.count < MirrorQualityLevel.allCases.count else { return nil }
+    let available = MirrorQualityLevel.allCases
+      .filter(supportedLevels.contains)
+      .map(\.title)
+    if available.count == 1, let profile = available.first {
+      return "This wired source supports only the \(profile) profile."
+    }
+    return "This wired source supports only: \(available.joined(separator: ", "))."
   }
 }

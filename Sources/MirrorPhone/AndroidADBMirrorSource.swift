@@ -180,6 +180,61 @@ struct AndroidDisplaySize: Equatable, Sendable {
     }
     return AndroidDisplaySize(width: encoderAligned(width), height: encoderAligned(height))
   }
+
+  func fitted(maxShortEdge: Int, maxLongEdge: Int) -> AndroidDisplaySize {
+    let shortEdge = min(width, height)
+    let longEdge = max(width, height)
+    let scale = min(
+      1,
+      min(Double(maxShortEdge) / Double(shortEdge), Double(maxLongEdge) / Double(longEdge))
+    )
+
+    func even(_ value: Int) -> Int {
+      max(2, Int((Double(value) * scale).rounded(.down)) / 2 * 2)
+    }
+    return AndroidDisplaySize(width: even(width), height: even(height))
+  }
+}
+
+struct AndroidScreenrecordConfiguration: Equatable, Sendable {
+  let level: MirrorQualityLevel
+  let size: AndroidDisplaySize?
+  let bitrate: Int
+
+  static func make(
+    level: MirrorQualityLevel,
+    nativeSize: AndroidDisplaySize?
+  ) -> AndroidScreenrecordConfiguration {
+    switch level {
+    case .quality:
+      AndroidScreenrecordConfiguration(level: level, size: nil, bitrate: 12_000_000)
+    case .balanced:
+      AndroidScreenrecordConfiguration(
+        level: level,
+        size: nativeSize?.fitted(maxShortEdge: 1080, maxLongEdge: 1920),
+        bitrate: 8_000_000
+      )
+    case .performance:
+      AndroidScreenrecordConfiguration(
+        level: level,
+        size: nativeSize?.fitted(maxShortEdge: 720, maxLongEdge: 1280),
+        bitrate: 4_000_000
+      )
+    }
+  }
+
+  var screenrecordArguments: [String] {
+    var arguments = [
+      "exec-out", "screenrecord",
+      "--output-format=h264",
+      "--bit-rate", String(bitrate),
+    ]
+    if let size {
+      arguments.append(contentsOf: ["--size", "\(size.width)x\(size.height)"])
+    }
+    arguments.append("-")
+    return arguments
+  }
 }
 
 enum AndroidVideoCompatibility {
@@ -301,10 +356,21 @@ final class AndroidADBDeviceMonitor: @unchecked Sendable {
 }
 
 @MainActor
-final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink {
+final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
+  QualityAdjustableMirrorSource
+{
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
   nonisolated let recordingTap = MirrorRecordingTap()
+  private let qualityController = MirrorQualityController()
+  var qualityState: MirrorQualityState { qualityController.state }
+  var onQualityStateChanged: ((MirrorQualityState) -> Void)? {
+    get { qualityController.onStateChanged }
+    set {
+      qualityController.onStateChanged = newValue
+      newValue?(qualityController.state)
+    }
+  }
   /// Fired when the input injector dies unexpectedly, so the UI can abandon any
   /// in-flight gesture instead of continuing it against a fresh server.
   var onInputInterrupted: (() -> Void)?
@@ -321,6 +387,11 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink {
   }
 
   var inputSink: DeviceInputSink? { self }
+
+  func setQualityMode(_ mode: MirrorQualityMode) {
+    guard let level = qualityController.setMode(mode) else { return }
+    runner?.setQualityLevel(level)
+  }
 
   func send(_ event: DeviceInputEvent) {
     switch event {
@@ -365,26 +436,67 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink {
     let videoSampleHandler: @Sendable (MirrorVideoSample) -> Void = { [recordingTap] sample in
       recordingTap.emit(video: sample)
     }
-    let runner: any AndroidVideoRunner =
-      if AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: deviceName) {
-        AndroidFramebufferRunner(
-          adbURL: adbURL,
-          serial: serial,
-          onFrame: frameHandler,
-          onVideoSample: videoSampleHandler,
-          onStatus: statusHandler
-        )
-      } else {
-        AndroidScreenrecordRunner(
-          adbURL: adbURL,
-          serial: serial,
-          onFrame: frameHandler,
-          onVideoSample: videoSampleHandler,
-          onStatus: statusHandler
-        )
+    let performanceHandler: @Sendable (MirrorPerformanceWindow) -> Void = { [weak self] window in
+      Task { @MainActor [weak self] in
+        guard let self, let level = qualityController.observe(window) else { return }
+        self.runner?.setQualityLevel(level)
       }
+    }
+    let availableLevelsHandler: @Sendable (
+      Set<MirrorQualityLevel>, String?
+    ) -> Void = { [weak self] levels, limitation in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        let changedLevel = qualityController.setSupportedLevels(
+          levels,
+          limitation: limitation
+        )
+        if let changedLevel {
+          self.runner?.setQualityLevel(changedLevel)
+        }
+      }
+    }
+    let appliedLevelHandler: @Sendable (
+      MirrorQualityLevel, String?
+    ) -> Void = { [weak self] level, limitation in
+      Task { @MainActor [weak self] in
+        guard let self, qualityController.state.effectiveLevel == level else { return }
+        qualityController.markApplied(limitation: limitation)
+      }
+    }
+    let runner: any AndroidVideoRunner
+    if AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: deviceName) {
+      _ = qualityController.setSupportedLevels(
+        [.quality],
+        limitation: "Adaptive quality is unavailable for framebuffer capture."
+      )
+      runner = AndroidFramebufferRunner(
+        adbURL: adbURL,
+        serial: serial,
+        onFrame: frameHandler,
+        onVideoSample: videoSampleHandler,
+        onStatus: statusHandler
+      )
+    } else {
+      runner = AndroidScreenrecordRunner(
+        adbURL: adbURL,
+        serial: serial,
+        initialQualityLevel: qualityController.state.effectiveLevel ?? .balanced,
+        onFrame: frameHandler,
+        onVideoSample: videoSampleHandler,
+        onStatus: statusHandler,
+        onPerformanceWindow: performanceHandler,
+        onAvailableLevelsChanged: availableLevelsHandler,
+        onQualityApplied: appliedLevelHandler
+      )
+    }
     try runner.start()
     self.runner = runner
+    if AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: deviceName) {
+      qualityController.markApplied(
+        limitation: "Adaptive quality is unavailable for framebuffer capture."
+      )
+    }
 
     // `screenrecord` is video-only, so capture the device's output audio
     // separately (scrcpy-style) and play it on the Mac. This is best-effort:
@@ -438,15 +550,20 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink {
 private protocol AndroidVideoRunner: AnyObject, Sendable {
   func start() throws
   func stop() async
+  func setQualityLevel(_ level: MirrorQualityLevel)
 }
 
 private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Sendable {
   typealias FrameHandler = @Sendable (CGImage) -> Void
   typealias StatusHandler = @Sendable (String) -> Void
+  typealias AvailableLevelsHandler = @Sendable (Set<MirrorQualityLevel>, String?) -> Void
+  typealias QualityAppliedHandler = @Sendable (MirrorQualityLevel, String?) -> Void
 
   private let adbURL: URL
   private let serial: String
   private let onStatus: StatusHandler
+  private let onAvailableLevelsChanged: AvailableLevelsHandler
+  private let onQualityApplied: QualityAppliedHandler
   private let queue = DispatchQueue(
     label: "com.rockyshi.mirrorphone.android-adb",
     qos: .userInteractive
@@ -463,8 +580,11 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
   private var rotationParser = AndroidRotationLogParser()
   private var lastRotation: Int?
   private var rotationRestartLaunchID: UUID?
-  private var fallbackSize: AndroidDisplaySize?
-  private var activeSize: AndroidDisplaySize?
+  private var qualityRestartLaunchID: UUID?
+  private var nativeSize: AndroidDisplaySize?
+  private var requestedQualityLevel: MirrorQualityLevel
+  private var unavailableQualityLevels = Set<MirrorQualityLevel>()
+  private var activeConfiguration: AndroidScreenrecordConfiguration?
   private var receivedVideoStream = false
   private var streamOutput = Data()
   private var stopped = true
@@ -472,17 +592,25 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
   init(
     adbURL: URL,
     serial: String,
+    initialQualityLevel: MirrorQualityLevel,
     onFrame: @escaping FrameHandler,
     onVideoSample: @escaping H264Decoder.VideoSampleHandler,
-    onStatus: @escaping StatusHandler
+    onStatus: @escaping StatusHandler,
+    onPerformanceWindow: @escaping MirrorFramePressureMeter.WindowHandler,
+    onAvailableLevelsChanged: @escaping AvailableLevelsHandler,
+    onQualityApplied: @escaping QualityAppliedHandler
   ) {
     self.adbURL = adbURL
     self.serial = serial
     self.onStatus = onStatus
+    self.onAvailableLevelsChanged = onAvailableLevelsChanged
+    self.onQualityApplied = onQualityApplied
+    requestedQualityLevel = initialQualityLevel
     streamDecoder = AndroidH264StreamDecoder(
       onVideoSample: onVideoSample,
       onFrame: onFrame,
-      onStatus: onStatus
+      onStatus: onStatus,
+      onPerformanceWindow: onPerformanceWindow
     )
   }
 
@@ -491,7 +619,14 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
       guard stopped else { return }
       stopped = false
       do {
-        fallbackSize = queryDisplaySize()?.screenrecordFallback
+        nativeSize = queryDisplaySize()
+        if nativeSize == nil {
+          unavailableQualityLevels = [.balanced, .performance]
+          onAvailableLevelsChanged(
+            [.quality],
+            "Android display size is unavailable; using native Quality."
+          )
+        }
         try launch()
         try launchRotationMonitor()
       } catch {
@@ -499,6 +634,26 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
         stopProcesses()
         throw error
       }
+    }
+  }
+
+  func setQualityLevel(_ level: MirrorQualityLevel) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      requestedQualityLevel = level
+      guard !stopped else { return }
+      let configuration = resolvedConfiguration()
+      guard configuration != activeConfiguration else {
+        onQualityApplied(
+          configuration.level,
+          qualityLimitation(for: configuration.level)
+        )
+        return
+      }
+      guard let activeLaunchID, let process, process.isRunning else { return }
+      qualityRestartLaunchID = activeLaunchID
+      onStatus("Adjusting Android quality to \(configuration.level.title)")
+      process.terminate()
     }
   }
 
@@ -521,8 +676,10 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
         rotationParser.reset()
         lastRotation = nil
         rotationRestartLaunchID = nil
-        fallbackSize = nil
-        activeSize = nil
+        qualityRestartLaunchID = nil
+        nativeSize = nil
+        unavailableQualityLevels.removeAll()
+        activeConfiguration = nil
         receivedVideoStream = false
         streamOutput.removeAll(keepingCapacity: false)
         streamDecoder.reset()
@@ -542,18 +699,10 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     streamOutput.removeAll(keepingCapacity: true)
     receivedVideoStream = false
     activeLaunchID = launchID
+    let configuration = resolvedConfiguration()
+    activeConfiguration = configuration
     process.executableURL = adbURL
-    var arguments = [
-      "-s", serial,
-      "exec-out", "screenrecord",
-      "--output-format=h264",
-      "--bit-rate", "12000000",
-    ]
-    if let activeSize {
-      arguments.append(contentsOf: ["--size", "\(activeSize.width)x\(activeSize.height)"])
-    }
-    arguments.append("-")
-    process.arguments = arguments
+    process.arguments = ["-s", serial] + configuration.screenrecordArguments
     process.standardOutput = outputPipe
     process.standardError = errorPipe
 
@@ -597,6 +746,10 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     self.errorPipe = errorPipe
     do {
       try process.run()
+      onQualityApplied(
+        configuration.level,
+        qualityLimitation(for: configuration.level)
+      )
     } catch {
       outputPipe.fileHandleForReading.readabilityHandler = nil
       errorPipe.fileHandleForReading.readabilityHandler = nil
@@ -704,6 +857,10 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     if wasRotationRestart {
       rotationRestartLaunchID = nil
     }
+    let wasQualityRestart = qualityRestartLaunchID == launchID
+    if wasQualityRestart {
+      qualityRestartLaunchID = nil
+    }
     outputPipe?.fileHandleForReading.readabilityHandler = nil
     errorPipe?.fileHandleForReading.readabilityHandler = nil
     streamDecoder.finish()
@@ -713,7 +870,7 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     activeLaunchID = nil
     guard !stopped else { return }
 
-    if wasRotationRestart {
+    if wasRotationRestart || wasQualityRestart {
       queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
         guard let self, !stopped, process == nil else { return }
         do {
@@ -725,12 +882,19 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
       return
     }
 
-    if !receivedVideoStream, activeSize == nil, let fallbackSize {
-      activeSize = fallbackSize
-      onStatus(
-        "The Android encoder rejected native resolution · retrying at "
-          + "\(fallbackSize.width) × \(fallbackSize.height)"
+    if !receivedVideoStream, let failedLevel = activeConfiguration?.level,
+      failedLevel != .performance
+    {
+      unavailableQualityLevels.insert(failedLevel)
+      let availableLevels = Set(MirrorQualityLevel.allCases).subtracting(
+        unavailableQualityLevels
       )
+      let nextConfiguration = resolvedConfiguration()
+      let limitation =
+        "The Android encoder rejected \(failedLevel.title); using "
+        + "\(nextConfiguration.level.title)."
+      onAvailableLevelsChanged(availableLevels, limitation)
+      onStatus(limitation)
       queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
         guard let self, !stopped, process == nil else { return }
         do {
@@ -779,6 +943,24 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     } catch {
       return nil
     }
+  }
+
+  private func resolvedConfiguration() -> AndroidScreenrecordConfiguration {
+    let available = Set(MirrorQualityLevel.allCases).subtracting(unavailableQualityLevels)
+    let level: MirrorQualityLevel
+    if available.contains(requestedQualityLevel) {
+      level = requestedQualityLevel
+    } else if let lower = available.filter({ $0 < requestedQualityLevel }).max() {
+      level = lower
+    } else {
+      level = available.min() ?? .performance
+    }
+    return AndroidScreenrecordConfiguration.make(level: level, nativeSize: nativeSize)
+  }
+
+  private func qualityLimitation(for level: MirrorQualityLevel) -> String? {
+    guard level != requestedQualityLevel else { return nil }
+    return "The Android encoder supports up to \(level.title) for this session."
   }
 }
 
@@ -830,6 +1012,8 @@ private final class AndroidFramebufferRunner: AndroidVideoRunner, @unchecked Sen
       }
     }
   }
+
+  func setQualityLevel(_ level: MirrorQualityLevel) {}
 
   func stop() async {
     await withCheckedContinuation { continuation in
@@ -1007,9 +1191,14 @@ private final class AndroidH264StreamDecoder: @unchecked Sendable {
   init(
     onVideoSample: @escaping H264Decoder.VideoSampleHandler,
     onFrame: @escaping FrameHandler,
-    onStatus: @escaping StatusHandler
+    onStatus: @escaping StatusHandler,
+    onPerformanceWindow: @escaping MirrorFramePressureMeter.WindowHandler
   ) {
-    decoder = H264Decoder(onVideoSample: onVideoSample, onFrame: onFrame)
+    decoder = H264Decoder(
+      onVideoSample: onVideoSample,
+      onPerformanceWindow: onPerformanceWindow,
+      onFrame: onFrame
+    )
     self.onStatus = onStatus
   }
 

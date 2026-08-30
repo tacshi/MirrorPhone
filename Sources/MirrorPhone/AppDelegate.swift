@@ -99,6 +99,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       withTitle: "Actual Size", action: #selector(MirrorWindowController.actualSize(_:)),
       keyEquivalent: "0")
     actualSizeItem.target = nil
+    viewMenu.addItem(.separator())
+    let qualityItem = viewMenu.addItem(withTitle: "Quality Profile", action: nil, keyEquivalent: "")
+    let qualityMenu = NSMenu(title: "Quality Profile")
+    let qualityActions: [(String, Selector)] = [
+      ("Auto", #selector(MirrorWindowController.selectAutomaticQuality(_:))),
+      ("Quality", #selector(MirrorWindowController.selectQualityQuality(_:))),
+      ("Balanced", #selector(MirrorWindowController.selectBalancedQuality(_:))),
+      ("Performance", #selector(MirrorWindowController.selectPerformanceQuality(_:))),
+    ]
+    for (title, action) in qualityActions {
+      let item = qualityMenu.addItem(withTitle: title, action: action, keyEquivalent: "")
+      item.target = nil
+    }
+    qualityItem.submenu = qualityMenu
     viewMenuItem.submenu = viewMenu
 
     let windowMenuItem = NSMenuItem()

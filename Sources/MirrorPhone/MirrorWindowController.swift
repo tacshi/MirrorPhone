@@ -19,12 +19,22 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
 
   private let mirrorView = MirrorView()
   private let devicePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+  private let qualityPopup = NSPopUpButton(frame: .zero, pullsDown: false)
   private let actualSizeButton = NSButton()
   private let captureButton = NSButton()
   private let recordButton = NSButton()
   private var assignment = MirrorWindowAssignment.empty
   private var receivesCoordinatedAssignments = false
   private var sourceFactory: any MirrorSourceCreating = DefaultMirrorSourceFactory()
+  private var qualityPreferences: any MirrorQualityPreferenceStoring =
+    UserDefaultsMirrorQualityPreferences.shared
+  private var qualityMode = MirrorQualityMode.automatic
+  private var displayedQualityState = MirrorQualityState(
+    mode: .automatic,
+    effectiveLevel: nil,
+    isAdjusting: false,
+    limitation: nil
+  )
   private var source: (any MirrorSource)?
   private var sourceDeviceID: String?
   private var connectionTask: Task<Void, Never>?
@@ -64,7 +74,11 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     self.init(sourceFactory: DefaultMirrorSourceFactory())
   }
 
-  convenience init(sourceFactory: any MirrorSourceCreating) {
+  convenience init(
+    sourceFactory: any MirrorSourceCreating,
+    qualityPreferences: any MirrorQualityPreferenceStoring =
+      UserDefaultsMirrorQualityPreferences.shared
+  ) {
     let window = NSWindow(
       contentRect: NSRect(origin: .zero, size: Self.defaultContentSize),
       styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -73,6 +87,14 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     )
     self.init(window: window)
     self.sourceFactory = sourceFactory
+    self.qualityPreferences = qualityPreferences
+    qualityMode = qualityPreferences.defaultMode
+    displayedQualityState = MirrorQualityState(
+      mode: qualityMode,
+      effectiveLevel: nil,
+      isAdjusting: false,
+      limitation: nil
+    )
     configureWindow()
   }
 
@@ -114,6 +136,8 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     devicePopup.translatesAutoresizingMaskIntoConstraints = false
     devicePopup.addItem(withTitle: "No device")
     devicePopup.isEnabled = false
+
+    configureQualityPopup()
 
     configureTitlebarButton(
       actualSizeButton,
@@ -167,12 +191,17 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     leadingAccessory.view = deviceContainer
     window.addTitlebarAccessoryViewController(leadingAccessory)
 
-    let actionsContainer = NSView(frame: NSRect(x: 0, y: 0, width: 106, height: 28))
+    let actionsContainer = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 28))
+    actionsContainer.addSubview(qualityPopup)
     actionsContainer.addSubview(actualSizeButton)
     actionsContainer.addSubview(captureButton)
     actionsContainer.addSubview(recordButton)
     NSLayoutConstraint.activate([
-      actualSizeButton.leadingAnchor.constraint(equalTo: actionsContainer.leadingAnchor, constant: 6),
+      qualityPopup.leadingAnchor.constraint(equalTo: actionsContainer.leadingAnchor, constant: 6),
+      qualityPopup.centerYAnchor.constraint(equalTo: actionsContainer.centerYAnchor),
+      qualityPopup.widthAnchor.constraint(equalToConstant: 132),
+      qualityPopup.heightAnchor.constraint(equalToConstant: 22),
+      actualSizeButton.leadingAnchor.constraint(equalTo: qualityPopup.trailingAnchor, constant: 8),
       actualSizeButton.centerYAnchor.constraint(equalTo: actionsContainer.centerYAnchor),
       captureButton.leadingAnchor.constraint(equalTo: actualSizeButton.trailingAnchor, constant: 8),
       captureButton.centerYAnchor.constraint(equalTo: actionsContainer.centerYAnchor),
@@ -189,6 +218,19 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     trailingAccessory.layoutAttribute = .trailing
     trailingAccessory.view = actionsContainer
     window.addTitlebarAccessoryViewController(trailingAccessory)
+  }
+
+  private func configureQualityPopup() {
+    qualityPopup.target = self
+    qualityPopup.action = #selector(qualitySelectionChanged(_:))
+    qualityPopup.controlSize = .small
+    qualityPopup.font = .systemFont(ofSize: 11)
+    qualityPopup.translatesAutoresizingMaskIntoConstraints = false
+    for mode in MirrorQualityMode.allCases {
+      qualityPopup.addItem(withTitle: mode.title)
+      qualityPopup.lastItem?.representedObject = mode.rawValue
+    }
+    updateQualityControls()
   }
 
   private func configureTitlebarButton(
@@ -216,6 +258,85 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       return
     }
     onDeviceSelectionRequested?(deviceID)
+  }
+
+  @objc private func qualitySelectionChanged(_ sender: Any?) {
+    guard let rawValue = qualityPopup.selectedItem?.representedObject as? String,
+      let mode = MirrorQualityMode(rawValue: rawValue)
+    else {
+      updateQualityControls()
+      return
+    }
+    selectQualityMode(mode)
+  }
+
+  @objc func selectAutomaticQuality(_ sender: Any?) {
+    selectQualityMode(.automatic)
+  }
+
+  @objc func selectQualityQuality(_ sender: Any?) {
+    selectQualityMode(.quality)
+  }
+
+  @objc func selectBalancedQuality(_ sender: Any?) {
+    selectQualityMode(.balanced)
+  }
+
+  @objc func selectPerformanceQuality(_ sender: Any?) {
+    selectQualityMode(.performance)
+  }
+
+  var selectedQualityMode: MirrorQualityMode { qualityMode }
+
+  private func selectQualityMode(_ mode: MirrorQualityMode) {
+    qualityMode = mode
+    qualityPreferences.defaultMode = mode
+    if let adjustableSource = source as? any QualityAdjustableMirrorSource {
+      adjustableSource.setQualityMode(mode)
+      displayedQualityState = adjustableSource.qualityState
+    } else {
+      displayedQualityState = MirrorQualityState(
+        mode: mode,
+        effectiveLevel: nil,
+        isAdjusting: false,
+        limitation: nil
+      )
+    }
+    updateQualityControls()
+  }
+
+  private func updateQualityControls() {
+    let displayTitle: String
+    if displayedQualityState.isAdjusting {
+      displayTitle = "\(qualityMode.title) · Adjusting…"
+    } else if qualityMode == .automatic,
+      let effectiveLevel = displayedQualityState.effectiveLevel
+    {
+      displayTitle = "Auto · \(effectiveLevel.title)"
+    } else if let requestedLevel = qualityMode.fixedLevel,
+      let effectiveLevel = displayedQualityState.effectiveLevel,
+      requestedLevel != effectiveLevel
+    {
+      displayTitle = "\(qualityMode.title) · \(effectiveLevel.title)"
+    } else {
+      displayTitle = qualityMode.title
+    }
+
+    for item in qualityPopup.itemArray {
+      guard let rawValue = item.representedObject as? String,
+        let mode = MirrorQualityMode(rawValue: rawValue)
+      else { continue }
+      item.title = mode == .automatic && qualityMode == .automatic ? displayTitle : mode.title
+      item.state = mode == qualityMode ? .on : .off
+    }
+    if let selectedItem = qualityPopup.itemArray.first(where: {
+      ($0.representedObject as? String) == qualityMode.rawValue
+    }) {
+      qualityPopup.select(selectedItem)
+    }
+    qualityPopup.isEnabled = !isPreparingToClose
+    qualityPopup.toolTip = displayedQualityState.limitation ?? "Capture quality profile"
+    qualityPopup.setAccessibilityLabel(displayTitle)
   }
 
   func apply(assignment newAssignment: MirrorWindowAssignment) {
@@ -320,6 +441,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     let previousSource = source
     source = nil
     sourceDeviceID = nil
+    resetQualityStateForNoSource()
     updateRecordingAction()
     mirrorView.resetInputState()
     mirrorView.onInput = nil
@@ -353,6 +475,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
           if connectionGeneration == generation {
             source = nil
             sourceDeviceID = nil
+            resetQualityStateForNoSource()
             updateRecordingAction()
           }
           return
@@ -362,6 +485,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         if connectionGeneration == generation {
           source = nil
           sourceDeviceID = nil
+          resetQualityStateForNoSource()
           updateRecordingAction()
           setStatus(error.localizedDescription)
           present(error: error)
@@ -374,6 +498,8 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   private func configure(source newSource: any MirrorSource, for device: MirrorDevice) {
+    source = newSource
+    sourceDeviceID = device.id
     newSource.onFrame = { [weak self] frame in
       guard let self, sourceDeviceID == device.id,
         assignment.selectedDeviceID == device.id || isPreparingDeviceSwitch
@@ -410,9 +536,32 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         self?.mirrorView.resetInputState()
       }
     }
-    source = newSource
-    sourceDeviceID = device.id
+    if let adjustableSource = newSource as? any QualityAdjustableMirrorSource {
+      let sourceIdentity = ObjectIdentifier(newSource)
+      adjustableSource.onQualityStateChanged = { [weak self] state in
+        guard let self, let source,
+          ObjectIdentifier(source) == sourceIdentity
+        else { return }
+        displayedQualityState = state
+        updateQualityControls()
+      }
+      adjustableSource.setQualityMode(qualityMode)
+      displayedQualityState = adjustableSource.qualityState
+    } else {
+      resetQualityStateForNoSource()
+    }
+    updateQualityControls()
     updateRecordingAction()
+  }
+
+  private func resetQualityStateForNoSource() {
+    displayedQualityState = MirrorQualityState(
+      mode: qualityMode,
+      effectiveLevel: nil,
+      isAdjusting: false,
+      limitation: nil
+    )
+    updateQualityControls()
   }
 
   private func stopConnectionImmediately(clearFrame: Bool) async {
@@ -429,6 +578,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     let previousSource = source
     source = nil
     sourceDeviceID = nil
+    resetQualityStateForNoSource()
     updateRecordingAction()
     await previousSource?.stop()
     guard connectionGeneration == generation else { return }
@@ -528,6 +678,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         if connectionGeneration == generation, sourceDeviceID == device.id {
           source = nil
           sourceDeviceID = nil
+          resetQualityStateForNoSource()
           updateRecordingAction()
         }
         return false
@@ -538,6 +689,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       if connectionGeneration == generation, sourceDeviceID == device.id {
         source = nil
         sourceDeviceID = nil
+        resetQualityStateForNoSource()
         updateRecordingAction()
         setStatus(error.localizedDescription)
         present(error: error)
@@ -903,7 +1055,21 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     if menuItem.action == #selector(captureImage(_:)) {
       return mirrorView.displayedFrame != nil
     }
+    if let mode = qualityMode(for: menuItem.action) {
+      menuItem.state = mode == qualityMode ? .on : .off
+      return !isPreparingToClose
+    }
     return true
+  }
+
+  private func qualityMode(for action: Selector?) -> MirrorQualityMode? {
+    switch action {
+    case #selector(selectAutomaticQuality(_:)): .automatic
+    case #selector(selectQualityQuality(_:)): .quality
+    case #selector(selectBalancedQuality(_:)): .balanced
+    case #selector(selectPerformanceQuality(_:)): .performance
+    default: nil
+    }
   }
 
   var hasRecordingToFinalize: Bool {
@@ -920,6 +1086,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     closeRequested = true
     isPreparingToClose = true
     updateRecordingAction()
+    updateQualityControls()
     onWindowCloseRequested?()
     Task { @MainActor [weak self, weak sender] in
       guard let self else { return }
@@ -930,6 +1097,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       }
       isPreparingToClose = false
       updateRecordingAction()
+      updateQualityControls()
       closeRequested = false
       guard succeeded, let sender else { return }
       allowWindowClose = true
@@ -949,6 +1117,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     let remainingSource = source
     source = nil
     sourceDeviceID = nil
+    resetQualityStateForNoSource()
     Task { [remainingSource] in
       await remainingSource?.stop()
     }
@@ -1001,7 +1170,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       let inKeepBand =
         inX && rel >= -Self.titlebarKeepBelow
         && rel <= resolvedTitlebarHeight + Self.titlebarKeepAbove
-      if !inKeepBand, devicePopup.cell?.isHighlighted != true {
+      if !inKeepBand, !isTitlebarPickerHighlighted {
         setTitlebarVisible(false)
       }
     } else if inX, rel >= -Self.titlebarRevealBelow, rel <= Self.titlebarRevealAbove {
@@ -1045,7 +1214,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
 
     let inKeepBand =
       inX && rel >= -Self.titlebarKeepBelow && rel <= resolvedTitlebarHeight + Self.titlebarKeepAbove
-    if inKeepBand || devicePopup.cell?.isHighlighted == true {
+    if inKeepBand || isTitlebarPickerHighlighted {
       titlebarHidePendingSince = nil
       return
     }
@@ -1056,6 +1225,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       titlebarHidePendingSince = nil
       setTitlebarVisible(false)
     }
+  }
+
+  private var isTitlebarPickerHighlighted: Bool {
+    devicePopup.cell?.isHighlighted == true || qualityPopup.cell?.isHighlighted == true
   }
 
   func setTitlebarVisible(_ visible: Bool) {

@@ -123,6 +123,17 @@ protocol RecordableMirrorSource: MirrorSource {
 }
 
 @MainActor
+protocol QualityAdjustableMirrorSource: MirrorSource {
+  var qualityState: MirrorQualityState { get }
+  var onQualityStateChanged: ((MirrorQualityState) -> Void)? { get set }
+
+  /// Updates the desired profile without replacing the source. Implementations
+  /// may restart only their internal video transport while preserving audio,
+  /// input forwarding, and any attached recording tap.
+  func setQualityMode(_ mode: MirrorQualityMode)
+}
+
+@MainActor
 protocol DeviceDetectingMirrorSource: MirrorSource {
   var onDeviceDetected: ((String) -> Void)? { get set }
 }

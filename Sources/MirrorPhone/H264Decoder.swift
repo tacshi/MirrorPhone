@@ -8,6 +8,7 @@ final class H264Decoder: @unchecked Sendable {
 
   private let onFrame: FrameHandler
   private let onVideoSample: VideoSampleHandler?
+  private let pressureMeter: MirrorFramePressureMeter?
   private let imageContext = CIContext(options: [.cacheIntermediates: false])
   private var formatDescription: CMVideoFormatDescription?
   private var session: VTDecompressionSession?
@@ -28,9 +29,11 @@ final class H264Decoder: @unchecked Sendable {
 
   init(
     onVideoSample: VideoSampleHandler? = nil,
+    onPerformanceWindow: MirrorFramePressureMeter.WindowHandler? = nil,
     onFrame: @escaping FrameHandler
   ) {
     self.onVideoSample = onVideoSample
+    pressureMeter = onPerformanceWindow.map(MirrorFramePressureMeter.init(onWindow:))
     self.onFrame = onFrame
   }
 
@@ -164,12 +167,16 @@ final class H264Decoder: @unchecked Sendable {
     // Decode synchronously: the stream carries no timestamps, so realtime-paced
     // asynchronous decompression queues frames and the mirror falls ever further
     // behind the live screen. Each frame is displayed the moment it arrives.
+    let decodeStartedAt = ProcessInfo.processInfo.systemUptime
     let decodeStatus = VTDecompressionSessionDecodeFrame(
       session,
       sampleBuffer: sampleBuffer,
       flags: [],
       frameRefcon: frameContext.toOpaque(),
       infoFlagsOut: &outputFlags
+    )
+    pressureMeter?.recordDecode(
+      duration: ProcessInfo.processInfo.systemUptime - decodeStartedAt
     )
     if decodeStatus != noErr {
       frameContext.release()
@@ -186,6 +193,7 @@ final class H264Decoder: @unchecked Sendable {
     pendingLock.lock()
     pendingBuffer = nil
     pendingLock.unlock()
+    pressureMeter?.reset()
   }
 
   private func scheduleRender(of imageBuffer: CVImageBuffer, orientation: CGImagePropertyOrientation) {
@@ -195,6 +203,9 @@ final class H264Decoder: @unchecked Sendable {
     let alreadyScheduled = renderScheduled
     renderScheduled = true
     pendingLock.unlock()
+    if alreadyScheduled {
+      pressureMeter?.recordDisplayReplacement()
+    }
     guard !alreadyScheduled else { return }
 
     renderQueue.async { [weak self] in
@@ -207,8 +218,12 @@ final class H264Decoder: @unchecked Sendable {
       pendingLock.unlock()
       guard let buffer else { return }
 
+      let renderStartedAt = ProcessInfo.processInfo.systemUptime
       let image = CIImage(cvPixelBuffer: buffer).oriented(orientation)
       guard let frame = imageContext.createCGImage(image, from: image.extent) else { return }
+      pressureMeter?.recordRender(
+        duration: ProcessInfo.processInfo.systemUptime - renderStartedAt
+      )
       onFrame(frame)
     }
   }
@@ -241,6 +256,7 @@ final class H264Decoder: @unchecked Sendable {
       }
     guard status == noErr, let refcon, let imageBuffer else { return }
     let decoder = Unmanaged<H264Decoder>.fromOpaque(refcon).takeUnretainedValue()
+    decoder.pressureMeter?.recordSourceFrame()
     decoder.offerRecordingSample(
       from: imageBuffer,
       orientation: frameContext?.orientation ?? .up,
