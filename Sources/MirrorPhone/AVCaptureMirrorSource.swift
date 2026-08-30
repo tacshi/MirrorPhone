@@ -3,20 +3,29 @@ import AppKit
 import CoreImage
 
 @MainActor
-final class AVCaptureMirrorSource: NSObject, MirrorSource,
-  AVCaptureVideoDataOutputSampleBufferDelegate
+final class AVCaptureMirrorSource: NSObject, RecordableMirrorSource,
+  AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate
 {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
+  nonisolated let recordingTap = MirrorRecordingTap()
 
   private let uniqueID: String
   private nonisolated let session = AVCaptureSession()
   private nonisolated let audioPreviewOutput = AVCaptureAudioPreviewOutput()
+  private nonisolated let audioDataOutput = AVCaptureAudioDataOutput()
   private nonisolated let captureQueue = DispatchQueue(
     label: "com.rockyshi.mirrorphone.av-capture",
     qos: .userInteractive
   )
+  private nonisolated let displayQueue = DispatchQueue(
+    label: "com.rockyshi.mirrorphone.av-display",
+    qos: .userInteractive
+  )
   private nonisolated let imageContext = CIContext(options: [.cacheIntermediates: false])
+  private nonisolated let displayLock = NSLock()
+  private nonisolated(unsafe) var pendingDisplayImage: CIImage?
+  private nonisolated(unsafe) var displayScheduled = false
 
   init(uniqueID: String) {
     self.uniqueID = uniqueID
@@ -46,6 +55,14 @@ final class AVCaptureMirrorSource: NSObject, MirrorSource,
     if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
       _ = await AVCaptureDevice.requestAccess(for: .audio)
     }
+    let audioAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    if audioAuthorized {
+      recordingTap.setAudioState(.pending)
+    } else {
+      recordingTap.setAudioState(
+        .unavailable("Microphone access is off, so this recording has no device audio.")
+      )
+    }
 
     let input: AVCaptureDeviceInput
     do {
@@ -55,12 +72,16 @@ final class AVCaptureMirrorSource: NSObject, MirrorSource,
     }
 
     let output = AVCaptureVideoDataOutput()
-    output.alwaysDiscardsLateVideoFrames = true
+    // The delegate itself only hands frames to the recorder tap and a bounded
+    // latest-frame display stage, so it can accept native cadence without
+    // AVFoundation dropping frames before recording sees them.
+    output.alwaysDiscardsLateVideoFrames = false
     // iPhone and iPad screen devices expose a muxed native format that does
     // not permit callers to force a pixel format. Let AVFoundation choose its
     // default uncompressed output so the capture graph can perform conversion.
     output.videoSettings = nil
     output.setSampleBufferDelegate(self, queue: captureQueue)
+    audioDataOutput.setSampleBufferDelegate(self, queue: captureQueue)
 
     session.beginConfiguration()
     session.sessionPreset = .high
@@ -77,6 +98,13 @@ final class AVCaptureMirrorSource: NSObject, MirrorSource,
     audioPreviewOutput.volume = 1.0
     if session.canAddOutput(audioPreviewOutput) {
       session.addOutput(audioPreviewOutput)
+    }
+    if audioAuthorized, session.canAddOutput(audioDataOutput) {
+      session.addOutput(audioDataOutput)
+    } else if audioAuthorized {
+      recordingTap.setAudioState(
+        .unavailable("This wired source does not expose recordable device audio.")
+      )
     }
     session.commitConfiguration()
 
@@ -104,11 +132,43 @@ final class AVCaptureMirrorSource: NSObject, MirrorSource,
     didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
+    if output === audioDataOutput {
+      recordingTap.setAudioState(.available)
+      recordingTap.emit(audio: MirrorAudioSample(sampleBuffer: sampleBuffer))
+      return
+    }
     guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
     let image = CIImage(cvPixelBuffer: pixelBuffer)
-    guard let frame = imageContext.createCGImage(image, from: image.extent) else { return }
-    Task { @MainActor [weak self] in
-      self?.onFrame?(frame)
+    recordingTap.emit(
+      video: MirrorVideoSample(
+        image: image,
+        presentationTime: sampleBuffer.presentationTimeStamp
+      )
+    )
+    scheduleDisplay(image)
+  }
+
+  private nonisolated func scheduleDisplay(_ image: CIImage) {
+    displayLock.lock()
+    pendingDisplayImage = image
+    let alreadyScheduled = displayScheduled
+    displayScheduled = true
+    displayLock.unlock()
+    guard !alreadyScheduled else { return }
+
+    displayQueue.async { [weak self] in
+      guard let self else { return }
+      displayLock.lock()
+      let image = pendingDisplayImage
+      pendingDisplayImage = nil
+      displayScheduled = false
+      displayLock.unlock()
+      guard let image,
+        let frame = imageContext.createCGImage(image, from: image.extent)
+      else { return }
+      Task { @MainActor [weak self] in
+        self?.onFrame?(frame)
+      }
     }
   }
 }

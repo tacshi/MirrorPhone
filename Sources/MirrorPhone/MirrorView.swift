@@ -93,6 +93,10 @@ final class MirrorView: NSView {
   private let loading = NSStackView()
   private let loadingIndicator = NSProgressIndicator()
   private let loadingLabel = NSTextField(labelWithString: "")
+  private let recordingOverlay = NSView()
+  private let recordingDot = NSTextField(labelWithString: "●")
+  private let recordingLabel = NSTextField(labelWithString: "00:00:00")
+  private let recordingMutedIcon = NSImageView()
 
   /// How many view points a wheel "line" (non-precise scroll) maps to before
   /// conversion to device pixels. Precise trackpad deltas use ×1 directly.
@@ -102,6 +106,7 @@ final class MirrorView: NSView {
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     configureTutorial()
+    configureRecordingOverlay()
     scrollMapper.emit = { [weak self] phase, point, frame in
       self?.emitTouch(phase, point: point, referenceSize: frame)
     }
@@ -110,6 +115,7 @@ final class MirrorView: NSView {
   required init?(coder: NSCoder) {
     super.init(coder: coder)
     configureTutorial()
+    configureRecordingOverlay()
     scrollMapper.emit = { [weak self] phase, point, frame in
       self?.emitTouch(phase, point: point, referenceSize: frame)
     }
@@ -312,6 +318,44 @@ final class MirrorView: NSView {
     needsDisplay = true
   }
 
+  func showRecording(elapsed: Duration, audioState: MirrorRecordingAudioState) {
+    let components = elapsed.components
+    let totalSeconds = max(0, Int(components.seconds))
+    let hours = totalSeconds / 3_600
+    let minutes = (totalSeconds % 3_600) / 60
+    let seconds = totalSeconds % 60
+    recordingDot.isHidden = false
+    recordingDot.textColor = .systemRed
+    recordingLabel.stringValue = String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+    recordingMutedIcon.isHidden = {
+      if case .unavailable = audioState { return false }
+      return true
+    }()
+    recordingMutedIcon.toolTip = {
+      if case .unavailable(let reason) = audioState { return reason }
+      return nil
+    }()
+    recordingOverlay.isHidden = false
+  }
+
+  func showRecordingFinishing() {
+    recordingDot.isHidden = true
+    recordingLabel.stringValue = "Finishing…"
+    recordingMutedIcon.isHidden = true
+    recordingOverlay.isHidden = false
+  }
+
+  func showRecordingSaved() {
+    recordingDot.isHidden = true
+    recordingLabel.stringValue = "Saved"
+    recordingMutedIcon.isHidden = true
+    recordingOverlay.isHidden = false
+  }
+
+  func hideRecordingStatus() {
+    recordingOverlay.isHidden = true
+  }
+
   private func configureTutorial() {
     let icon = NSImageView()
     icon.image = NSImage(
@@ -382,6 +426,43 @@ final class MirrorView: NSView {
       loading.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -36),
       loadingIndicator.widthAnchor.constraint(equalToConstant: 32),
       loadingIndicator.heightAnchor.constraint(equalToConstant: 32),
+    ])
+  }
+
+  private func configureRecordingOverlay() {
+    recordingOverlay.wantsLayer = true
+    recordingOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+    recordingOverlay.layer?.cornerRadius = 8
+    recordingOverlay.translatesAutoresizingMaskIntoConstraints = false
+    recordingOverlay.isHidden = true
+
+    recordingDot.font = .systemFont(ofSize: 13, weight: .bold)
+    recordingDot.textColor = .systemRed
+    recordingLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+    recordingLabel.textColor = .white
+    recordingMutedIcon.image = NSImage(
+      systemSymbolName: "speaker.slash.fill",
+      accessibilityDescription: "Device audio unavailable"
+    )
+    recordingMutedIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+    recordingMutedIcon.contentTintColor = .white
+    recordingMutedIcon.isHidden = true
+
+    let stack = NSStackView(views: [recordingDot, recordingLabel, recordingMutedIcon])
+    stack.orientation = .horizontal
+    stack.alignment = .centerY
+    stack.spacing = 6
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    recordingOverlay.addSubview(stack)
+    addSubview(recordingOverlay)
+
+    NSLayoutConstraint.activate([
+      stack.leadingAnchor.constraint(equalTo: recordingOverlay.leadingAnchor, constant: 10),
+      stack.trailingAnchor.constraint(equalTo: recordingOverlay.trailingAnchor, constant: -10),
+      stack.topAnchor.constraint(equalTo: recordingOverlay.topAnchor, constant: 6),
+      stack.bottomAnchor.constraint(equalTo: recordingOverlay.bottomAnchor, constant: -6),
+      recordingOverlay.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+      recordingOverlay.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
     ])
   }
 }

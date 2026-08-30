@@ -1,7 +1,8 @@
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
-final class MirrorWindowController: NSWindowController, NSWindowDelegate {
+final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation {
   private static let defaultContentSize = NSSize(width: 453, height: 1014)
   // Reveal/hide are decided from the pointer's position relative to the mirror's
   // top edge, which never moves (the window grows *above* it). Reveal only right
@@ -20,6 +21,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
   private let devicePopup = NSPopUpButton(frame: .zero, pullsDown: false)
   private let actualSizeButton = NSButton()
   private let captureButton = NSButton()
+  private let recordButton = NSButton()
   private var devices = [MirrorDevice]()
   private var selectedDeviceID: String?
   private var source: (any MirrorSource)?
@@ -37,6 +39,19 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
   private var mirrorTopConstraint: NSLayoutConstraint?
   private var titlebarMonitorTask: Task<Void, Never>?
   private var titlebarHidePendingSince: ContinuousClock.Instant?
+  private var recorder: MP4Recorder?
+  private var recordingTap: MirrorRecordingTap?
+  private var recordingStartedAt: ContinuousClock.Instant?
+  private var recordingAudioState = MirrorRecordingAudioState.pending
+  private var recordingTimerTask: Task<Void, Never>?
+  private var recordingFinishTask: Task<Bool, Never>?
+  private var recordingStatusDismissTask: Task<Void, Never>?
+  private var savePanelOpen = false
+  private var sourceActionAfterRecording: (() -> Void)?
+  private var sourceActionFinalizationTask: Task<Void, Never>?
+  private var closeRequested = false
+  private var allowWindowClose = false
+  private var recordingGeneration = 0
 
   convenience init() {
     let window = NSWindow(
@@ -98,6 +113,13 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
       help: "Capture image",
       action: #selector(captureImage(_:))
     )
+    configureTitlebarButton(
+      recordButton,
+      symbol: "record.circle",
+      help: "Start recording…",
+      action: #selector(toggleRecording(_:))
+    )
+    updateRecordingAction()
 
     installTitlebarAccessories(in: window)
 
@@ -131,9 +153,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     leadingAccessory.view = deviceContainer
     window.addTitlebarAccessoryViewController(leadingAccessory)
 
-    let actionsContainer = NSView(frame: NSRect(x: 0, y: 0, width: 76, height: 28))
+    let actionsContainer = NSView(frame: NSRect(x: 0, y: 0, width: 106, height: 28))
     actionsContainer.addSubview(actualSizeButton)
     actionsContainer.addSubview(captureButton)
+    actionsContainer.addSubview(recordButton)
     NSLayoutConstraint.activate([
       actualSizeButton.leadingAnchor.constraint(equalTo: actionsContainer.leadingAnchor, constant: 6),
       actualSizeButton.centerYAnchor.constraint(equalTo: actionsContainer.centerYAnchor),
@@ -143,6 +166,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
       actualSizeButton.heightAnchor.constraint(equalToConstant: 20),
       captureButton.widthAnchor.constraint(equalToConstant: 22),
       captureButton.heightAnchor.constraint(equalToConstant: 20),
+      recordButton.leadingAnchor.constraint(equalTo: captureButton.trailingAnchor, constant: 8),
+      recordButton.centerYAnchor.constraint(equalTo: actionsContainer.centerYAnchor),
+      recordButton.widthAnchor.constraint(equalToConstant: 22),
+      recordButton.heightAnchor.constraint(equalToConstant: 20),
     ])
     let trailingAccessory = NSTitlebarAccessoryViewController()
     trailingAccessory.layoutAttribute = .trailing
@@ -244,11 +271,18 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
   }
 
   private func connect(to device: MirrorDevice, preserveFrame: Bool = false) {
+    if hasRecordingToFinalize {
+      performAfterRecordingFinalizes { [weak self] in
+        self?.connect(to: device, preserveFrame: preserveFrame)
+      }
+      return
+    }
     connectionGeneration += 1
     let generation = connectionGeneration
     connectionTask?.cancel()
     let previousSource = source
     source = nil
+    updateRecordingAction()
     mirrorView.resetInputState()
     mirrorView.onInput = nil
     activeDeviceName = device.name
@@ -278,6 +312,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
           }
           receivedFirstFrame = true
           reportedFrameSize = frameSize
+          updateRecordingAction()
           setStatus("Live · \(device.name) · \(frame.width) × \(frame.height)")
         }
       }
@@ -301,6 +336,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         }
       }
       source = newSource
+      updateRecordingAction()
 
       do {
         try await newSource.start()
@@ -315,6 +351,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
         await newSource.stop()
         if connectionGeneration == generation {
           source = nil
+          updateRecordingAction()
           setStatus(error.localizedDescription)
           present(error: error)
         }
@@ -326,6 +363,12 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
   }
 
   private func stopConnection() {
+    if hasRecordingToFinalize {
+      performAfterRecordingFinalizes { [weak self] in
+        self?.stopConnection()
+      }
+      return
+    }
     connectionGeneration += 1
     let generation = connectionGeneration
     connectionTask?.cancel()
@@ -333,6 +376,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     mirrorView.onInput = nil
     let previousSource = source
     source = nil
+    updateRecordingAction()
     connectionTask = Task { [weak self] in
       await previousSource?.stop()
       guard let self, connectionGeneration == generation else { return }
@@ -347,6 +391,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     reportedFrameSize = nil
     mirrorAspectRatio = nil
     mirrorView.clear()
+    updateRecordingAction()
     restorePortraitWindow()
   }
 
@@ -446,15 +491,267 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     }
   }
 
+  @objc func toggleRecording(_ sender: Any?) {
+    if recorder != nil || recordingFinishTask != nil {
+      Task { [weak self] in
+        _ = await self?.finishRecording()
+      }
+      return
+    }
+    guard !savePanelOpen,
+      mirrorView.displayedFrame != nil,
+      source is any RecordableMirrorSource,
+      let window
+    else {
+      if mirrorView.displayedFrame == nil {
+        present(error: MirrorPhoneError.noFrame)
+      }
+      return
+    }
+
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.mpeg4Movie]
+    panel.canCreateDirectories = true
+    panel.nameFieldStringValue =
+      "MirrorPhone \(Self.filenameDateFormatter.string(from: Date())).mp4"
+    savePanelOpen = true
+    updateRecordingAction()
+    panel.beginSheetModal(for: window) { [weak self] response in
+      guard let self else { return }
+      savePanelOpen = false
+      updateRecordingAction()
+      guard response == .OK, let destinationURL = panel.url else { return }
+      startRecording(at: destinationURL)
+    }
+  }
+
+  private func startRecording(at destinationURL: URL) {
+    guard recorder == nil, recordingFinishTask == nil,
+      let frame = mirrorView.displayedFrame,
+      let recordableSource = source as? any RecordableMirrorSource
+    else { return }
+
+    recordingGeneration += 1
+    let generation = recordingGeneration
+    do {
+      let recorder = try MP4Recorder(
+        destinationURL: destinationURL,
+        canvasSize: CGSize(width: frame.width, height: frame.height)
+      ) { [weak self] state in
+        Task { @MainActor [weak self] in
+          guard let self, recordingGeneration == generation else { return }
+          recordingAudioState = state
+          updateRecordingOverlay()
+        }
+      }
+      try recorder.start()
+      self.recorder = recorder
+      recordingTap = recordableSource.recordingTap
+      recordingStartedAt = .now
+      recordingAudioState = .pending
+      recordingStatusDismissTask?.cancel()
+      recordableSource.recordingTap.attach(recorder)
+      startRecordingTimer()
+      updateRecordingAction()
+      updateRecordingOverlay()
+    } catch {
+      presentRecordingFailure(error, destinationURL: destinationURL)
+    }
+  }
+
+  private func startRecordingTimer() {
+    recordingTimerTask?.cancel()
+    recordingTimerTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self, recorder != nil, recordingFinishTask == nil else { return }
+        updateRecordingOverlay()
+        try? await Task.sleep(for: .seconds(1))
+      }
+    }
+  }
+
+  private func updateRecordingOverlay() {
+    guard let started = recordingStartedAt, recorder != nil, recordingFinishTask == nil else {
+      return
+    }
+    mirrorView.showRecording(
+      elapsed: started.duration(to: .now),
+      audioState: recordingAudioState
+    )
+  }
+
+  @discardableResult
+  func finishRecording() async -> Bool {
+    if let recordingFinishTask {
+      return await recordingFinishTask.value
+    }
+    guard let recorder else { return true }
+
+    recordingTap?.detach(recorder)
+    recordingTimerTask?.cancel()
+    recordingTimerTask = nil
+    mirrorView.showRecordingFinishing()
+    updateRecordingAction(finishing: true)
+    let destinationURL = recorderDestinationURL(recorder)
+
+    let task = Task { @MainActor [weak self] () -> Bool in
+      do {
+        let result = try await recorder.finish()
+        guard let self else { return true }
+        completeRecording(success: true)
+        showSavedStatus()
+        if result.droppedVideoFrameCount > 0 {
+          setStatus("Saved with \(result.droppedVideoFrameCount) overloaded video frames dropped")
+        }
+        return true
+      } catch {
+        guard let self else { return false }
+        completeRecording(success: false)
+        presentRecordingFailure(error, destinationURL: destinationURL)
+        return false
+      }
+    }
+    recordingFinishTask = task
+    return await task.value
+  }
+
+  private func completeRecording(success: Bool) {
+    recorder = nil
+    recordingTap = nil
+    recordingStartedAt = nil
+    recordingFinishTask = nil
+    recordingAudioState = .pending
+    updateRecordingAction()
+    if !success {
+      mirrorView.hideRecordingStatus()
+    }
+  }
+
+  private func showSavedStatus() {
+    mirrorView.showRecordingSaved()
+    recordingStatusDismissTask?.cancel()
+    recordingStatusDismissTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: .seconds(2))
+      guard !Task.isCancelled, let self, recorder == nil else { return }
+      mirrorView.hideRecordingStatus()
+    }
+  }
+
+  private func updateRecordingAction(finishing: Bool = false) {
+    let isRecording = recorder != nil
+    let isFinishing = finishing || recordingFinishTask != nil
+    let canStart =
+      mirrorView.displayedFrame != nil && source is any RecordableMirrorSource && !savePanelOpen
+    recordButton.isEnabled = !isFinishing && (isRecording || canStart)
+    let title: String
+    let symbol: String
+    if isFinishing {
+      title = "Finishing…"
+      symbol = "hourglass"
+    } else if isRecording {
+      title = "Stop recording"
+      symbol = "stop.circle.fill"
+    } else {
+      title = "Start recording…"
+      symbol = "record.circle"
+    }
+    recordButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+    recordButton.contentTintColor = isRecording && !isFinishing ? .systemRed : nil
+    recordButton.toolTip = title
+    recordButton.setAccessibilityLabel(title)
+  }
+
+  func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+    if menuItem.action == #selector(toggleRecording(_:)) {
+      if recordingFinishTask != nil {
+        menuItem.title = "Finishing…"
+        return false
+      }
+      if recorder != nil {
+        menuItem.title = "Stop Recording"
+        return true
+      }
+      menuItem.title = "Start Recording…"
+      return mirrorView.displayedFrame != nil && source is any RecordableMirrorSource && !savePanelOpen
+    }
+    if menuItem.action == #selector(captureImage(_:)) {
+      return mirrorView.displayedFrame != nil
+    }
+    return true
+  }
+
+  var hasRecordingToFinalize: Bool {
+    recorder != nil || recordingFinishTask != nil
+  }
+
+  func finalizeRecordingForTermination() async -> Bool {
+    sourceActionAfterRecording = nil
+    sourceActionFinalizationTask?.cancel()
+    return await finishRecording()
+  }
+
+  private func performAfterRecordingFinalizes(_ action: @escaping () -> Void) {
+    sourceActionAfterRecording = action
+    guard sourceActionFinalizationTask == nil else { return }
+    sourceActionFinalizationTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      _ = await finishRecording()
+      let action = sourceActionAfterRecording
+      sourceActionAfterRecording = nil
+      sourceActionFinalizationTask = nil
+      guard !Task.isCancelled else { return }
+      action?()
+    }
+  }
+
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    if allowWindowClose || !hasRecordingToFinalize { return true }
+    guard !closeRequested else { return false }
+    closeRequested = true
+    sourceActionAfterRecording = nil
+    sourceActionFinalizationTask?.cancel()
+    Task { @MainActor [weak self, weak sender] in
+      guard let self else { return }
+      let succeeded = await finishRecording()
+      closeRequested = false
+      guard succeeded, let sender else { return }
+      allowWindowClose = true
+      sender.performClose(nil)
+    }
+    return false
+  }
+
   func windowWillClose(_ notification: Notification) {
     titlebarMonitorTask?.cancel()
     titlebarMonitorTask = nil
     deviceDiscovery?.stop()
     deviceDiscovery = nil
     connectionTask?.cancel()
+    recordingTimerTask?.cancel()
+    recordingStatusDismissTask?.cancel()
     Task { [source] in
       await source?.stop()
     }
+  }
+
+  private func presentRecordingFailure(_ error: Error, destinationURL: URL) {
+    guard let window else { return }
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "The recording could not be saved"
+    alert.informativeText =
+      "\(error.localizedDescription)\n\nAny existing file was left unchanged. Check free space or choose another folder and try again."
+    alert.addButton(withTitle: "OK")
+    alert.addButton(withTitle: "Show Folder")
+    alert.beginSheetModal(for: window) { response in
+      if response == .alertSecondButtonReturn {
+        NSWorkspace.shared.open(destinationURL.deletingLastPathComponent())
+      }
+    }
+  }
+
+  private func recorderDestinationURL(_ recorder: MP4Recorder) -> URL {
+    recorder.outputURL
   }
 
   private func setStatus(_ status: String) {

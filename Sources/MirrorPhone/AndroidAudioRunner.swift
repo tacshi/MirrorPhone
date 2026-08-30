@@ -1,4 +1,6 @@
 import AVFoundation
+import AudioToolbox
+import CoreMedia
 import Foundation
 
 /// Locates the bundled scrcpy-style audio capturer that is launched on the
@@ -21,6 +23,138 @@ enum AndroidAudioServer {
       return URL(fileURLWithPath: override)
     }
     return Bundle.main.url(forResource: "mirrorphone-audio-server", withExtension: "jar")
+  }
+}
+
+/// Converts the Android helper's fragmented 48 kHz / stereo / signed 16-bit
+/// little-endian byte stream into linear-PCM sample buffers. Each helper launch
+/// owns one timeline; restarting it resets the anchor so the recording retains
+/// the real gap while audio is unavailable.
+final class AndroidPCMSampleBuilder: @unchecked Sendable {
+  private static let sampleRate: Int32 = 48_000
+  private static let bytesPerFrame = 4
+
+  private var remainder = Data()
+  private var nextPresentationTime: CMTime?
+  private var timelineID = UUID()
+
+  func append(_ data: Data, arrivalTime: CMTime) throws -> [MirrorAudioSample] {
+    var bytes = remainder
+    bytes.append(data)
+    let usableCount = bytes.count - (bytes.count % Self.bytesPerFrame)
+    guard usableCount > 0 else {
+      remainder = bytes
+      return []
+    }
+    remainder = Data(bytes.suffix(bytes.count - usableCount))
+    let payload = Data(bytes.prefix(usableCount))
+    let frameCount = usableCount / Self.bytesPerFrame
+    let duration = CMTime(value: CMTimeValue(frameCount), timescale: Self.sampleRate)
+    let presentationTime = nextPresentationTime ?? (arrivalTime - duration)
+    let sampleBuffer = try Self.makeSampleBuffer(
+      payload,
+      frameCount: frameCount,
+      presentationTime: presentationTime
+    )
+    nextPresentationTime = presentationTime + duration
+    return [
+      MirrorAudioSample(
+        sampleBuffer: sampleBuffer,
+        hostClockAnchor: MirrorAudioHostClockAnchor(
+          timelineID: timelineID,
+          bufferEndTime: arrivalTime
+        )
+      )
+    ]
+  }
+
+  func resetTimeline() {
+    remainder.removeAll(keepingCapacity: true)
+    nextPresentationTime = nil
+    timelineID = UUID()
+  }
+
+  private static func makeSampleBuffer(
+    _ data: Data,
+    frameCount: Int,
+    presentationTime: CMTime
+  ) throws -> CMSampleBuffer {
+    var description = AudioStreamBasicDescription(
+      mSampleRate: Double(sampleRate),
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+      mBytesPerPacket: UInt32(bytesPerFrame),
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(bytesPerFrame),
+      mChannelsPerFrame: 2,
+      mBitsPerChannel: 16,
+      mReserved: 0
+    )
+    var formatDescription: CMAudioFormatDescription?
+    guard
+      CMAudioFormatDescriptionCreate(
+        allocator: kCFAllocatorDefault,
+        asbd: &description,
+        layoutSize: 0,
+        layout: nil,
+        magicCookieSize: 0,
+        magicCookie: nil,
+        extensions: nil,
+        formatDescriptionOut: &formatDescription
+      ) == noErr,
+      let formatDescription
+    else { throw MP4RecorderError.audioSampleFailed }
+
+    var blockBuffer: CMBlockBuffer?
+    guard
+      CMBlockBufferCreateWithMemoryBlock(
+        allocator: kCFAllocatorDefault,
+        memoryBlock: nil,
+        blockLength: data.count,
+        blockAllocator: kCFAllocatorDefault,
+        customBlockSource: nil,
+        offsetToData: 0,
+        dataLength: data.count,
+        flags: 0,
+        blockBufferOut: &blockBuffer
+      ) == kCMBlockBufferNoErr,
+      let blockBuffer
+    else { throw MP4RecorderError.audioSampleFailed }
+    let copyStatus = data.withUnsafeBytes { bytes in
+      guard let baseAddress = bytes.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+      return CMBlockBufferReplaceDataBytes(
+        with: baseAddress,
+        blockBuffer: blockBuffer,
+        offsetIntoDestination: 0,
+        dataLength: data.count
+      )
+    }
+    guard copyStatus == kCMBlockBufferNoErr else {
+      throw MP4RecorderError.audioSampleFailed
+    }
+
+    var timing = CMSampleTimingInfo(
+      duration: CMTime(value: 1, timescale: sampleRate),
+      presentationTimeStamp: presentationTime,
+      decodeTimeStamp: .invalid
+    )
+    var sampleSize = bytesPerFrame
+    var sampleBuffer: CMSampleBuffer?
+    guard
+      CMSampleBufferCreateReady(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: blockBuffer,
+        formatDescription: formatDescription,
+        sampleCount: frameCount,
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &timing,
+        sampleSizeEntryCount: 1,
+        sampleSizeArray: &sampleSize,
+        sampleBufferOut: &sampleBuffer
+      ) == noErr,
+      let sampleBuffer
+    else { throw MP4RecorderError.audioSampleFailed }
+    return sampleBuffer
   }
 }
 
@@ -115,6 +249,7 @@ final class AndroidAudioRunner: @unchecked Sendable {
 
   private let adbURL: URL
   private let serial: String
+  private let recordingTap: MirrorRecordingTap
   private let onStatus: StatusHandler
   private let queue = DispatchQueue(
     label: "com.rockyshi.mirrorphone.android-audio",
@@ -128,6 +263,8 @@ final class AndroidAudioRunner: @unchecked Sendable {
   private var activeLaunchID: UUID?
   private var attemptsRemaining = 3
   private var receivedByteCount = 0
+  private let sampleBuilder = AndroidPCMSampleBuilder()
+  private var sampleBuildingDisabled = false
   private var stopped = true
 
   /// A launch that streamed at least this much PCM (~10 s) counts as healthy
@@ -135,9 +272,15 @@ final class AndroidAudioRunner: @unchecked Sendable {
   /// permanently give up on audio.
   private static let healthyLaunchByteCount = 2_000_000
 
-  init(adbURL: URL, serial: String, onStatus: @escaping StatusHandler) {
+  init(
+    adbURL: URL,
+    serial: String,
+    recordingTap: MirrorRecordingTap,
+    onStatus: @escaping StatusHandler
+  ) {
     self.adbURL = adbURL
     self.serial = serial
+    self.recordingTap = recordingTap
     self.onStatus = onStatus
   }
 
@@ -145,28 +288,30 @@ final class AndroidAudioRunner: @unchecked Sendable {
     queue.async { [self] in
       guard stopped else { return }
       stopped = false
+      recordingTap.setAudioState(.pending)
 
-      guard let player, player.start() else {
-        onStatus("Android audio is unavailable · this Mac has no usable audio output.")
-        stopped = true
-        return
+      if player?.start() != true {
+        onStatus("Android audio playback is unavailable on this Mac; recording will still try audio.")
       }
       guard let jarURL = AndroidAudioServer.jarURL else {
-        onStatus("Android audio is unavailable · rebuild MirrorPhone with the Android SDK present.")
+        reportUnavailable(
+          "Android audio is unavailable · rebuild MirrorPhone with the Android SDK present."
+        )
         stopped = true
         return
       }
       guard deviceSupportsAudioCapture() else {
-        onStatus("Android audio needs Android 11 or newer · mirroring video only.")
+        reportUnavailable("Android audio needs Android 11 or newer · mirroring video only.")
         stopped = true
         return
       }
       guard pushServer(jarURL) else {
-        onStatus("Android audio is unavailable · could not stage the capturer on the device.")
+        reportUnavailable(
+          "Android audio is unavailable · could not stage the capturer on the device."
+        )
         stopped = true
         return
       }
-      _ = player // retained for the lifetime of streaming
       launch()
     }
   }
@@ -236,6 +381,9 @@ final class AndroidAudioRunner: @unchecked Sendable {
     let errorPipe = Pipe()
     errorOutput.removeAll(keepingCapacity: true)
     receivedByteCount = 0
+    sampleBuilder.resetTimeline()
+    sampleBuildingDisabled = false
+    recordingTap.setAudioState(.pending)
     activeLaunchID = launchID
     process.executableURL = adbURL
     process.arguments = [
@@ -255,6 +403,21 @@ final class AndroidAudioRunner: @unchecked Sendable {
       self?.queue.async { [weak self] in
         guard let self, activeLaunchID == launchID, !stopped else { return }
         receivedByteCount += data.count
+        if !sampleBuildingDisabled {
+          do {
+            let arrivalTime = CMClockGetTime(CMClockGetHostTimeClock())
+            let samples = try sampleBuilder.append(data, arrivalTime: arrivalTime)
+            if !samples.isEmpty {
+              recordingTap.setAudioState(.available)
+              samples.forEach { recordingTap.emit(audio: $0) }
+            }
+          } catch {
+            sampleBuildingDisabled = true
+            recordingTap.setAudioState(
+              .unavailable("Android device audio could not be packaged for this recording.")
+            )
+          }
+        }
         player?.enqueue(data)
       }
     }
@@ -291,7 +454,7 @@ final class AndroidAudioRunner: @unchecked Sendable {
       self.outputPipe = nil
       self.errorPipe = nil
       activeLaunchID = nil
-      onStatus("Android audio failed to start: \(error.localizedDescription)")
+      reportUnavailable("Android audio failed to start: \(error.localizedDescription)")
     }
   }
 
@@ -313,18 +476,26 @@ final class AndroidAudioRunner: @unchecked Sendable {
       let detail = String(data: errorOutput, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
       if let detail, !detail.isEmpty {
-        onStatus("Android audio stopped: \(detail)")
+        reportUnavailable("Android audio stopped: \(detail)")
       } else {
-        onStatus("Android audio stopped · mirroring video only.")
+        reportUnavailable("Android audio stopped · mirroring video only.")
       }
       stopped = true
       player?.stop()
       return
     }
+    recordingTap.setAudioState(
+      .unavailable("Android audio was interrupted; retrying device audio.")
+    )
 
     queue.asyncAfter(deadline: .now() + 1) { [weak self] in
       guard let self, !stopped, process == nil else { return }
       launch()
     }
+  }
+
+  private func reportUnavailable(_ message: String) {
+    onStatus(message)
+    recordingTap.setAudioState(.unavailable(message))
   }
 }

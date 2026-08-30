@@ -4,8 +4,10 @@ import ImageIO
 
 final class H264Decoder: @unchecked Sendable {
   typealias FrameHandler = @Sendable (CGImage) -> Void
+  typealias VideoSampleHandler = @Sendable (MirrorVideoSample) -> Void
 
   private let onFrame: FrameHandler
+  private let onVideoSample: VideoSampleHandler?
   private let imageContext = CIContext(options: [.cacheIntermediates: false])
   private var formatDescription: CMVideoFormatDescription?
   private var session: VTDecompressionSession?
@@ -24,7 +26,11 @@ final class H264Decoder: @unchecked Sendable {
   private var pendingOrientation = CGImagePropertyOrientation.up
   private var renderScheduled = false
 
-  init(onFrame: @escaping FrameHandler) {
+  init(
+    onVideoSample: VideoSampleHandler? = nil,
+    onFrame: @escaping FrameHandler
+  ) {
+    self.onVideoSample = onVideoSample
     self.onFrame = onFrame
   }
 
@@ -149,7 +155,12 @@ final class H264Decoder: @unchecked Sendable {
     else { return }
 
     var outputFlags = VTDecodeInfoFlags()
-    let orientationBox = Unmanaged.passRetained(FrameOrientation(orientation))
+    let frameContext = Unmanaged.passRetained(
+      DecodedFrameContext(
+        orientation: orientation,
+        presentationTime: CMClockGetTime(CMClockGetHostTimeClock())
+      )
+    )
     // Decode synchronously: the stream carries no timestamps, so realtime-paced
     // asynchronous decompression queues frames and the mirror falls ever further
     // behind the live screen. Each frame is displayed the moment it arrives.
@@ -157,11 +168,11 @@ final class H264Decoder: @unchecked Sendable {
       session,
       sampleBuffer: sampleBuffer,
       flags: [],
-      frameRefcon: orientationBox.toOpaque(),
+      frameRefcon: frameContext.toOpaque(),
       infoFlagsOut: &outputFlags
     )
     if decodeStatus != noErr {
-      orientationBox.release()
+      frameContext.release()
     }
   }
 
@@ -202,6 +213,20 @@ final class H264Decoder: @unchecked Sendable {
     }
   }
 
+  private func offerRecordingSample(
+    from imageBuffer: CVImageBuffer,
+    orientation: CGImagePropertyOrientation,
+    presentationTime: CMTime
+  ) {
+    guard let onVideoSample else { return }
+    onVideoSample(
+      MirrorVideoSample(
+        image: CIImage(cvPixelBuffer: imageBuffer).oriented(orientation),
+        presentationTime: presentationTime
+      )
+    )
+  }
+
   private static let outputCallback: VTDecompressionOutputCallback = {
     refcon,
     frameRefcon,
@@ -210,20 +235,28 @@ final class H264Decoder: @unchecked Sendable {
     imageBuffer,
     _,
     _ in
-    let orientation =
+    let frameContext =
       frameRefcon.map {
-        Unmanaged<FrameOrientation>.fromOpaque($0).takeRetainedValue().value
-      } ?? .up
+        Unmanaged<DecodedFrameContext>.fromOpaque($0).takeRetainedValue()
+      }
     guard status == noErr, let refcon, let imageBuffer else { return }
     let decoder = Unmanaged<H264Decoder>.fromOpaque(refcon).takeUnretainedValue()
-    decoder.scheduleRender(of: imageBuffer, orientation: orientation)
+    decoder.offerRecordingSample(
+      from: imageBuffer,
+      orientation: frameContext?.orientation ?? .up,
+      presentationTime: frameContext?.presentationTime
+        ?? CMClockGetTime(CMClockGetHostTimeClock())
+    )
+    decoder.scheduleRender(of: imageBuffer, orientation: frameContext?.orientation ?? .up)
   }
 }
 
-private final class FrameOrientation {
-  let value: CGImagePropertyOrientation
+private final class DecodedFrameContext {
+  let orientation: CGImagePropertyOrientation
+  let presentationTime: CMTime
 
-  init(_ value: CGImagePropertyOrientation) {
-    self.value = value
+  init(orientation: CGImagePropertyOrientation, presentationTime: CMTime) {
+    self.orientation = orientation
+    self.presentationTime = presentationTime
   }
 }

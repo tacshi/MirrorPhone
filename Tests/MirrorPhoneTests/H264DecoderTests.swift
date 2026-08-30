@@ -15,18 +15,36 @@ struct H264DecoderTests {
     let framePayload = try copyEncodedBytes(from: encoded)
     let semaphore = DispatchSemaphore(value: 0)
     let output = DecodedImageBox()
-    let decoder = H264Decoder { image in
-      output.set(image)
-      semaphore.signal()
-    }
+    let recordingOutput = DecodedVideoSampleBox()
+    let decoder = H264Decoder(
+      onVideoSample: { sample in
+        recordingOutput.set(sample)
+      },
+      onFrame: { image in
+        output.set(image)
+        semaphore.signal()
+      }
+    )
 
     try decoder.configure(with: formatPayload)
+    decoder.decode(framePayload, orientation: .right)
     decoder.decode(framePayload, orientation: .right)
 
     #expect(semaphore.wait(timeout: .now() + 2) == .success)
     let image = try #require(output.image)
     #expect(image.width == 96)
     #expect(image.height == 64)
+    let recordingSamples = recordingOutput.samples
+    let recordingSample = try #require(recordingSamples.first)
+    #expect(recordingSamples.count == 2)
+    #expect(recordingSample.image.extent.size == CGSize(width: 96, height: 64))
+    #expect(recordingSample.presentationTime.isNumeric)
+    #expect(
+      CMTimeCompare(
+        recordingSamples[1].presentationTime,
+        recordingSamples[0].presentationTime
+      ) > 0
+    )
   }
 
   private func encodeTestFrame() throws -> CMSampleBuffer {
@@ -144,6 +162,19 @@ struct H264DecoderTests {
     }
     #expect(status == noErr)
     return result
+  }
+}
+
+private final class DecodedVideoSampleBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage = [MirrorVideoSample]()
+
+  var samples: [MirrorVideoSample] {
+    lock.withLock { storage }
+  }
+
+  func set(_ sample: MirrorVideoSample) {
+    lock.withLock { storage.append(sample) }
   }
 }
 

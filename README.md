@@ -26,6 +26,7 @@ iOS and iPadOS do not expose a public system-wide input-injection API comparable
 - iPhone and iPad audio through the USB capture stream
 - Android taps, drags, scrolling, text entry, navigation keys, and keyboard shortcuts
 - Automatic recovery when Android's `screenrecord` session reaches its time limit
+- Native-resolution MP4 screen recording at up to 60 fps with H.264 video and AAC device audio
 - Actual-size display mode and PNG frame capture
 - No iOS companion app or Android APK installation
 
@@ -77,7 +78,7 @@ swift test
 1. Connect the unlocked device by USB.
 2. Tap **Trust** on the device if prompted.
 3. Allow video access when macOS requests it.
-4. Allow microphone access to hear device audio. Denying it leaves video capture available.
+4. Allow microphone access to hear and record device audio. Denying it leaves video capture and video-only recording available.
 
 The device remains view-only in MirrorPhone.
 
@@ -91,11 +92,20 @@ Click or drag in the mirrored display to send touch input. Mouse-wheel and track
 
 Android audio and input require Android 11 or later. Audio capture depends on Android version and vendor policy; unsupported devices continue mirroring without sound. The phone may be muted while its output is routed to the Mac.
 
+## Record the device screen
+
+Choose **File > Start Recording…**, press <kbd>Command</kbd> + <kbd>R</kbd>, or use the record button beside the image-capture action. Pick the MP4 destination before recording starts, then use the same action to stop.
+
+Recordings contain only the device surface—not the MirrorPhone window, pointer, or recording indicator. Live mirroring stays at the device's native cadence, while recording preserves the source timestamps and cadence up to 60 fps; higher-refresh sources are sampled without slowing the mirror. The frame visible at start defines one fixed, even-sized canvas. If the device rotates, the correctly oriented image is aspect-fit over black bars rather than changing the MP4 dimensions. Android's periodic `screenrecord` refresh continues in the same file.
+
+Device audio is recorded when the source exposes it. Microphone denial on iPhone/iPad, Android versions before 11, vendor restrictions, or an interrupted audio stream never stop the video; the on-screen muted badge identifies a video-only recording. Switching devices, disconnecting, closing the window, or quitting safely finalizes the current file before continuing.
+
 ## Application shortcuts
 
 | Shortcut | Action |
 | --- | --- |
 | <kbd>Command</kbd> + <kbd>0</kbd> | Show the current frame at actual size |
+| <kbd>Command</kbd> + <kbd>R</kbd> | Start or stop an MP4 recording |
 | <kbd>Command</kbd> + <kbd>S</kbd> | Save the current frame as a PNG |
 
 ## Release build

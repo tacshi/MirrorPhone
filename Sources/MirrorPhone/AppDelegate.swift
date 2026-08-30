@@ -4,16 +4,16 @@ import AVFoundation
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   private var windowController: MirrorWindowController?
+  private var terminationTask: Task<Void, Never>?
 
   func applicationWillFinishLaunching(_ notification: Notification) {
     NSWindow.allowsAutomaticWindowTabbing = false
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    configureMainMenu()
-
     let controller = MirrorWindowController()
     windowController = controller
+    configureMainMenu()
     controller.showWindow(nil)
     NSApp.activate(ignoringOtherApps: true)
     registerCameraPermission()
@@ -21,6 +21,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     true
+  }
+
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard let windowController, windowController.hasRecordingToFinalize else {
+      return .terminateNow
+    }
+    guard terminationTask == nil else { return .terminateLater }
+    terminationTask = Task { @MainActor [weak self, weak sender] in
+      let succeeded = await windowController.finalizeRecordingForTermination()
+      self?.terminationTask = nil
+      sender?.reply(toApplicationShouldTerminate: succeeded)
+    }
+    return .terminateLater
   }
 
   private func registerCameraPermission() {
@@ -52,17 +65,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let viewMenuItem = NSMenuItem()
     mainMenu.addItem(viewMenuItem)
     let viewMenu = NSMenu(title: "View")
-    viewMenu.addItem(
+    let actualSizeItem = viewMenu.addItem(
       withTitle: "Actual Size", action: #selector(MirrorWindowController.actualSize(_:)),
       keyEquivalent: "0")
+    actualSizeItem.target = windowController
     viewMenuItem.submenu = viewMenu
 
     let fileMenuItem = NSMenuItem()
     mainMenu.addItem(fileMenuItem)
     let fileMenu = NSMenu(title: "File")
-    fileMenu.addItem(
+    let recordingItem = fileMenu.addItem(
+      withTitle: "Start Recording…",
+      action: #selector(MirrorWindowController.toggleRecording(_:)),
+      keyEquivalent: "r"
+    )
+    recordingItem.target = windowController
+    let captureItem = fileMenu.addItem(
       withTitle: "Capture Image", action: #selector(MirrorWindowController.captureImage(_:)),
       keyEquivalent: "s")
+    captureItem.target = windowController
     fileMenuItem.submenu = fileMenu
 
     NSApp.mainMenu = mainMenu
