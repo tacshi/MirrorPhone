@@ -32,6 +32,20 @@ enum MacInputMap {
     }
   }
 
+  /// Command-C/X/V belong to MirrorPhone's Edit menu. If a clipboard bridge is
+  /// unavailable and AppKit lets the disabled key equivalent reach the mirror
+  /// view, keep it from silently becoming an Android Control shortcut.
+  static func isClipboardCommandShortcut(
+    character: Character?,
+    modifierFlags: NSEvent.ModifierFlags
+  ) -> Bool {
+    guard modifierFlags.contains(.command), let character else { return false }
+    switch character.lowercased() {
+    case "c", "x", "v": return true
+    default: return false
+    }
+  }
+
   static func modifiers(from flags: NSEvent.ModifierFlags) -> DeviceInputModifiers {
     var modifiers: DeviceInputModifiers = []
     if flags.contains(.shift) { modifiers.insert(.shift) }

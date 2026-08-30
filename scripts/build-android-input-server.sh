@@ -1,14 +1,15 @@
 #!/bin/zsh
-# Compiles the device-side Android touch injector into a dex jar that can be
+# Compiles the device-side Android input and clipboard helper into a dex jar that can be
 # launched with `app_process`. On success the jar path is printed on stdout;
 # if the Android SDK is missing it warns on stderr and exits 0 so packaging can
-# continue without Android input forwarding.
+# continue without Android input or clipboard forwarding.
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 ROOT="${SCRIPT_DIR:h}"
 SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 SRC="$ROOT/AndroidInputServer/com/rockyshi/mirrorphone/InputServer.java"
+COMMON_SRC="$ROOT/AndroidServerCommon/com/rockyshi/mirrorphone/ShellContext.java"
 OUT_DIR="$ROOT/.build/android-input-server"
 JAR="$OUT_DIR/mirrorphone-input-server.jar"
 
@@ -22,6 +23,6 @@ fi
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/classes"
-javac --release 11 -cp "$ANDROID_JAR" -d "$OUT_DIR/classes" "$SRC"
+javac --release 11 -cp "$ANDROID_JAR" -d "$OUT_DIR/classes" "$COMMON_SRC" "$SRC"
 "$D8" --min-api 30 --output "$JAR" "$OUT_DIR/classes/com/rockyshi/mirrorphone"/*.class
 echo "$JAR"

@@ -9,6 +9,7 @@ SCRIPT_DIR="${0:A:h}"
 ROOT="${SCRIPT_DIR:h}"
 SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 SRC="$ROOT/AndroidAudioServer/com/rockyshi/mirrorphone/AudioServer.java"
+COMMON_SRC="$ROOT/AndroidServerCommon/com/rockyshi/mirrorphone/ShellContext.java"
 OUT_DIR="$ROOT/.build/android-audio-server"
 JAR="$OUT_DIR/mirrorphone-audio-server.jar"
 
@@ -22,6 +23,6 @@ fi
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/classes"
-javac --release 11 -cp "$ANDROID_JAR" -d "$OUT_DIR/classes" "$SRC"
+javac --release 11 -cp "$ANDROID_JAR" -d "$OUT_DIR/classes" "$COMMON_SRC" "$SRC"
 "$D8" --min-api 30 --output "$JAR" "$OUT_DIR/classes/com/rockyshi/mirrorphone"/*.class
 echo "$JAR"

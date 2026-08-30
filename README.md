@@ -94,9 +94,17 @@ The device remains view-only in MirrorPhone.
 2. Connect the unlocked device by USB and select a USB mode that permits debugging, such as File Transfer.
 3. Accept the **Allow USB debugging** prompt on the device.
 
-Click or drag in the mirrored display to send touch input. Mouse-wheel and trackpad scrolling are translated into swipe gestures. When the MirrorPhone window is active, text, navigation keys, and common Command-key shortcuts are forwarded to Android.
+Click or drag in the mirrored display to send touch input. Mouse-wheel and trackpad scrolling are translated into swipe gestures. When the MirrorPhone window is active, text and navigation keys are forwarded to Android. Control-key shortcuts remain raw Android keyboard shortcuts.
 
 Android audio and input require Android 11 or later. Audio capture depends on Android version and vendor policy; unsupported devices continue mirroring without sound. The phone may be muted while its output is routed to the Mac.
+
+### Android clipboard
+
+Command-C and Command-X copy or cut the current Android selection into the Mac clipboard. Command-V copies Mac plain text to Android and pastes it into the focused Android field. Multiline Unicode text is supported up to 256 KiB; images, files, URIs, and rich formatting are not transferred.
+
+While MirrorPhone is active, clipboard changes from the Android device automatically update the Mac only when that device's window is key. Background device windows cannot overwrite the clipboard, ignored changes are not replayed when switching windows, and Mac clipboard changes are sent to Android only when you invoke Paste. If a device or vendor ROM blocks automatic clipboard access, explicit copy and paste remain available when possible; clipboard failure never stops mirroring or ordinary input.
+
+Pasting places the Mac text on Android's system clipboard, where Android applications may be able to read it. Avoid pasting passwords or other sensitive content unless you trust the connected device and its applications.
 
 ## Choose capture quality
 
@@ -129,6 +137,9 @@ Device audio is recorded when the source exposes it. Microphone denial on iPhone
 | --- | --- |
 | <kbd>Command</kbd> + <kbd>N</kbd> | Open a new device window |
 | <kbd>Command</kbd> + <kbd>0</kbd> | Show the current frame at actual size |
+| <kbd>Command</kbd> + <kbd>C</kbd> | Copy the current Android selection to the Mac |
+| <kbd>Command</kbd> + <kbd>X</kbd> | Cut the current Android selection to the Mac |
+| <kbd>Command</kbd> + <kbd>V</kbd> | Paste Mac plain text into Android |
 | <kbd>Command</kbd> + <kbd>R</kbd> | Start or stop an MP4 recording |
 | <kbd>Command</kbd> + <kbd>S</kbd> | Save the current frame as a PNG |
 

@@ -126,6 +126,22 @@ struct DeviceInputEventTests {
     #expect(!modifiers.contains(.control))
   }
 
+  @Test("Command clipboard shortcuts stay in the AppKit Edit menu")
+  func clipboardMenuShortcutsAreReserved() {
+    #expect(
+      MacInputMap.isClipboardCommandShortcut(character: "c", modifierFlags: [.command])
+    )
+    #expect(
+      MacInputMap.isClipboardCommandShortcut(character: "X", modifierFlags: [.command, .shift])
+    )
+    #expect(
+      !MacInputMap.isClipboardCommandShortcut(character: "v", modifierFlags: [.control])
+    )
+    #expect(
+      !MacInputMap.isClipboardCommandShortcut(character: "a", modifierFlags: [.command])
+    )
+  }
+
   @Test("Android adapts semantic keys to its existing keycodes")
   func androidKeycodesRemainStable() {
     let expected: [(DeviceKey, Int)] = [

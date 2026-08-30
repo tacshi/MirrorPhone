@@ -108,6 +108,9 @@ protocol MirrorSource: AnyObject {
   /// input (e.g. the current iOS capture source, which is one-way). Declared
   /// here so it dynamically dispatches to each source's implementation.
   var inputSink: DeviceInputSink? { get }
+  /// The clipboard bridge for this source, or `nil` when clipboard exchange is
+  /// unsupported (including the current one-way iOS capture sources).
+  var clipboardBridge: DeviceClipboardBridge? { get }
 
   func start() async throws
   func stop() async
@@ -115,6 +118,7 @@ protocol MirrorSource: AnyObject {
 
 extension MirrorSource {
   var inputSink: DeviceInputSink? { nil }
+  var clipboardBridge: DeviceClipboardBridge? { nil }
 }
 
 @MainActor

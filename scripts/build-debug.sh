@@ -60,7 +60,7 @@ if [[ -n "$INPUT_JAR" && -f "$INPUT_JAR" ]]; then
   # Resources so codesign does not treat it as nested code.
   cp "$INPUT_JAR" "$APP_DIR/Contents/Resources/mirrorphone-input-server.jar"
 else
-  echo "warning: Android input server was not built; Android touch forwarding will be unavailable" >&2
+  echo "warning: Android input server was not built; Android input and clipboard forwarding will be unavailable" >&2
 fi
 
 codesign \

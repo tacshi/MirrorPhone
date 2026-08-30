@@ -203,6 +203,13 @@ final class MirrorView: NSView {
     }
     let modifiers = MacInputMap.modifiers(from: event.modifierFlags)
 
+    if MacInputMap.isClipboardCommandShortcut(
+      character: event.charactersIgnoringModifiers?.first,
+      modifierFlags: event.modifierFlags
+    ) {
+      return super.keyDown(with: event)
+    }
+
     if let key = MacInputMap.specialKey(macKeyCode: event.keyCode) {
       if !event.isARepeat {
         forwardedKeys[event.keyCode] = key
