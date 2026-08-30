@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT="${0:A:h}"
+SCRIPT_DIR="${0:A:h}"
+ROOT="${SCRIPT_DIR:h}"
 REPOSITORY="tacshi/MirrorPhone"
 
 fail() {
@@ -51,7 +52,7 @@ DMG="$ROOT/dist/MirrorPhone-$VERSION.dmg"
 CHECKSUM="$DMG.sha256"
 
 print -- "Building, signing, and notarizing MirrorPhone $VERSION..."
-"$ROOT/build-dmg.sh" "$VERSION"
+"$SCRIPT_DIR/build-dmg.sh" "$VERSION"
 
 [[ -f "$DMG" ]] || fail "expected artifact was not produced: $DMG"
 codesign --verify --verbose=2 "$DMG"

@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT="${0:A:h}"
+SCRIPT_DIR="${0:A:h}"
+ROOT="${SCRIPT_DIR:h}"
 if (( $# != 1 )); then
   print -u2 -- "usage: ${0:t} <version>"
   exit 64
@@ -79,12 +80,12 @@ FINAL_DMG="$DIST_DIR/$APP_NAME-$VERSION.dmg"
 print -- "Building $APP_NAME $VERSION..."
 MIRRORPHONE_SIGNING_IDENTITY="$SIGNING_IDENTITY" \
   MIRRORPHONE_BUILD_CONFIGURATION=release \
-  "$ROOT/build-debug.sh" >/dev/null
+  "$SCRIPT_DIR/build-debug.sh" >/dev/null
 [[ -d "$APP_BUNDLE" ]] || fail "$APP_BUNDLE was not produced"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$VERSION" "$APP_BUNDLE/Contents/Info.plist"
 
-# Release signing uses Apple's trusted timestamp service. build-debug.sh avoids
+# Release signing uses Apple's trusted timestamp service. scripts/build-debug.sh avoids
 # network-dependent timestamps for local builds, so its signatures are replaced here.
 xattr -cr "$APP_BUNDLE"
 if [[ -f "$APP_BUNDLE/Contents/Helpers/adb" ]]; then

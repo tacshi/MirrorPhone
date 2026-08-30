@@ -47,11 +47,11 @@ The video-only iPhone and iPad build does not require the Android SDK.
 Clone the repository, then run:
 
 ```sh
-./build-debug.sh
+./scripts/build-debug.sh
 open MirrorPhone.app
 ```
 
-Despite its name, `build-debug.sh` builds an optimized executable by default because the H.264 decode path must keep pace with high-refresh-rate displays. Set `MIRRORPHONE_BUILD_CONFIGURATION=debug` when a debug build is required.
+Despite its name, `scripts/build-debug.sh` builds an optimized executable by default because the H.264 decode path must keep pace with high-refresh-rate displays. Set `MIRRORPHONE_BUILD_CONFIGURATION=debug` when a debug build is required.
 
 The script packages the app, bundles `adb` from `PATH` or the standard Android SDK location, and builds the Android helpers when the required SDK tools are available. Missing Android helper dependencies do not stop the build; the affected audio or input feature is disabled instead.
 
@@ -110,12 +110,12 @@ Device audio is recorded when the source exposes it. Microphone denial on iPhone
 
 ## Release build
 
-`build-dmg.sh` creates a signed, notarized disk image:
+`scripts/build-dmg.sh` creates a signed, notarized disk image:
 
 ```sh
 DEVELOPER_ID_APPLICATION="Developer ID Application: Your Name (TEAMID)" \
 MIRRORPHONE_NOTARY_PROFILE="YOUR_NOTARYTOOL_PROFILE" \
-./build-dmg.sh 1.0.0
+./scripts/build-dmg.sh 1.0.0
 ```
 
 The signing identity is resolved from `MIRRORPHONE_SIGNING_IDENTITY`, then `DEVELOPER_ID_APPLICATION`. Exporting `DEVELOPER_ID_APPLICATION` from your shell profile leaves only the `notarytool` profile to pass per release. Set `MIRRORPHONE_TEAM_ID` instead to look the identity up in Keychain by team. The finished disk image is written to `dist/`.
@@ -123,7 +123,7 @@ The signing identity is resolved from `MIRRORPHONE_SIGNING_IDENTITY`, then `DEVE
 To build the disk image and upload it with a SHA-256 checksum to a draft GitHub Release, run:
 
 ```sh
-./release.sh 1.0.0
+./scripts/release.sh 1.0.0
 ```
 
 The release script requires a clean branch that exactly matches its remote upstream and an authenticated GitHub CLI. Select the Developer ID identity with `DEVELOPER_ID_APPLICATION` (or `MIRRORPHONE_TEAM_ID`) and the `notarytool` Keychain profile with `MIRRORPHONE_NOTARY_PROFILE`; the script does not accept or store signing credentials. Review the draft release before publishing it.
