@@ -26,6 +26,9 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   private var assignment = MirrorWindowAssignment.empty
   private var receivesCoordinatedAssignments = false
   private var sourceFactory: any MirrorSourceCreating = DefaultMirrorSourceFactory()
+  private var pasteboard: any MirrorPasteboard = GeneralMirrorPasteboard.shared
+  private var applicationIsActive: @MainActor () -> Bool = { NSApp.isActive }
+  private var windowIsKeyOverride: (@MainActor () -> Bool)?
   private var qualityPreferences: any MirrorQualityPreferenceStoring =
     UserDefaultsMirrorQualityPreferences.shared
   private var qualityMode = MirrorQualityMode.automatic
@@ -64,6 +67,8 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   private var closeRequested = false
   private var allowWindowClose = false
   private var recordingGeneration = 0
+  private var clipboardGeneration = 0
+  private var clipboardTask: Task<Void, Never>?
 
   var onDeviceSelectionRequested: ((String) -> Void)?
   var onWindowCloseRequested: (() -> Void)?
@@ -77,7 +82,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   convenience init(
     sourceFactory: any MirrorSourceCreating,
     qualityPreferences: any MirrorQualityPreferenceStoring =
-      UserDefaultsMirrorQualityPreferences.shared
+      UserDefaultsMirrorQualityPreferences.shared,
+    pasteboard: any MirrorPasteboard = GeneralMirrorPasteboard.shared,
+    applicationIsActive: @escaping @MainActor () -> Bool = { NSApp.isActive },
+    windowIsKey: (@MainActor () -> Bool)? = nil
   ) {
     let window = NSWindow(
       contentRect: NSRect(origin: .zero, size: Self.defaultContentSize),
@@ -88,6 +96,9 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     self.init(window: window)
     self.sourceFactory = sourceFactory
     self.qualityPreferences = qualityPreferences
+    self.pasteboard = pasteboard
+    self.applicationIsActive = applicationIsActive
+    self.windowIsKeyOverride = windowIsKey
     qualityMode = qualityPreferences.defaultMode
     displayedQualityState = MirrorQualityState(
       mode: qualityMode,
@@ -439,6 +450,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     let priorConnectionTask = connectionTask
     priorConnectionTask?.cancel()
     let previousSource = source
+    invalidateClipboardBinding()
     source = nil
     sourceDeviceID = nil
     resetQualityStateForNoSource()
@@ -473,6 +485,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         else {
           await newSource.stop()
           if connectionGeneration == generation {
+            invalidateClipboardBinding()
             source = nil
             sourceDeviceID = nil
             resetQualityStateForNoSource()
@@ -483,6 +496,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       } catch {
         await newSource.stop()
         if connectionGeneration == generation {
+          invalidateClipboardBinding()
           source = nil
           sourceDeviceID = nil
           resetQualityStateForNoSource()
@@ -498,6 +512,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   private func configure(source newSource: any MirrorSource, for device: MirrorDevice) {
+    invalidateClipboardBinding()
     source = newSource
     sourceDeviceID = device.id
     newSource.onFrame = { [weak self] frame in
@@ -536,6 +551,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
         self?.mirrorView.resetInputState()
       }
     }
+    configureClipboardBridge(for: newSource)
     if let adjustableSource = newSource as? any QualityAdjustableMirrorSource {
       let sourceIdentity = ObjectIdentifier(newSource)
       adjustableSource.onQualityStateChanged = { [weak self] state in
@@ -552,6 +568,72 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     }
     updateQualityControls()
     updateRecordingAction()
+  }
+
+  private func configureClipboardBridge(for newSource: any MirrorSource) {
+    guard let bridge = newSource.clipboardBridge else {
+      NSApp.mainMenu?.update()
+      return
+    }
+    let sourceIdentity = ObjectIdentifier(newSource)
+    bridge.onClipboardStateChanged = { [weak self] _ in
+      guard let self, let source, ObjectIdentifier(source) == sourceIdentity else { return }
+      NSApp.mainMenu?.update()
+    }
+    bridge.onClipboardContentChanged = { [weak self] content in
+      guard let self else { return }
+      handleAutomaticClipboardContent(content, sourceIdentity: sourceIdentity)
+    }
+    NSApp.mainMenu?.update()
+  }
+
+  private func invalidateClipboardBinding() {
+    source?.clipboardBridge?.onClipboardStateChanged = nil
+    source?.clipboardBridge?.onClipboardContentChanged = nil
+    clipboardGeneration += 1
+    clipboardTask?.cancel()
+    clipboardTask = nil
+    NSApp.mainMenu?.update()
+  }
+
+  private func handleAutomaticClipboardContent(
+    _ content: DeviceClipboardContent,
+    sourceIdentity: ObjectIdentifier
+  ) {
+    let isSourceCurrent = source.map { ObjectIdentifier($0) == sourceIdentity } ?? false
+    guard MirrorClipboardActivationPolicy.acceptsAutomaticUpdate(
+      isApplicationActive: applicationIsActive(),
+      isWindowKey: windowIsKeyOverride?() ?? window?.isKeyWindow == true,
+      isSourceCurrent: isSourceCurrent,
+      isDeviceConnected: assignment.isSelectedDeviceConnected,
+      isTransitioning: assignment.isTransitioning || isPreparingDeviceSwitch,
+      isClosing: isPreparingToClose
+    ) else { return }
+    try? applyClipboardContent(content, explicit: false)
+  }
+
+  private func applyClipboardContent(
+    _ content: DeviceClipboardContent,
+    explicit: Bool
+  ) throws {
+    switch content {
+    case .text(let text):
+      // ClipboardManager may report the same value more than once while Android
+      // classifies it. Avoid replacing matching rich Mac pasteboard types with
+      // a plain-text-only representation.
+      guard pasteboard.plainText != text else { return }
+      guard pasteboard.replacePlainText(with: text) else {
+        throw DeviceClipboardError.pasteboardWriteFailed
+      }
+    case .empty:
+      guard pasteboard.replacePlainText(with: nil) else {
+        throw DeviceClipboardError.pasteboardWriteFailed
+      }
+    case .unsupported:
+      if explicit {
+        NSSound.beep()
+      }
+    }
   }
 
   private func resetQualityStateForNoSource() {
@@ -576,6 +658,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     mirrorView.resetInputState()
     mirrorView.onInput = nil
     let previousSource = source
+    invalidateClipboardBinding()
     source = nil
     sourceDeviceID = nil
     resetQualityStateForNoSource()
@@ -676,6 +759,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       else {
         await newSource.stop()
         if connectionGeneration == generation, sourceDeviceID == device.id {
+          invalidateClipboardBinding()
           source = nil
           sourceDeviceID = nil
           resetQualityStateForNoSource()
@@ -687,6 +771,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     } catch {
       await newSource.stop()
       if connectionGeneration == generation, sourceDeviceID == device.id {
+        invalidateClipboardBinding()
         source = nil
         sourceDeviceID = nil
         resetQualityStateForNoSource()
@@ -839,6 +924,95 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     titlebarMonitorTask?.cancel()
     titlebarMonitorTask = nil
     setTitlebarVisible(false)
+  }
+
+  @objc func copyFromAndroid(_ sender: Any?) {
+    performClipboardSelection(.copy)
+  }
+
+  @objc func cutFromAndroid(_ sender: Any?) {
+    performClipboardSelection(.cut)
+  }
+
+  @objc func pasteToAndroid(_ sender: Any?) {
+    guard clipboardTask == nil, let bridge = clipboardBridgeForAction else {
+      NSSound.beep()
+      return
+    }
+    guard let text = pasteboard.plainText else {
+      NSSound.beep()
+      return
+    }
+
+    let generation = clipboardGeneration
+    let bridgeIdentity = ObjectIdentifier(bridge)
+    clipboardTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { finishClipboardTask(generation: generation) }
+      do {
+        try await bridge.paste(text)
+      } catch {
+        guard !Task.isCancelled,
+          isCurrentClipboardBridge(identity: bridgeIdentity, generation: generation)
+        else { return }
+        presentClipboardFailure(error, action: "Paste to Android")
+      }
+    }
+    NSApp.mainMenu?.update()
+  }
+
+  private func performClipboardSelection(_ operation: DeviceClipboardSelectionOperation) {
+    guard clipboardTask == nil, let bridge = clipboardBridgeForAction else {
+      NSSound.beep()
+      return
+    }
+
+    let generation = clipboardGeneration
+    let bridgeIdentity = ObjectIdentifier(bridge)
+    clipboardTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { finishClipboardTask(generation: generation) }
+      do {
+        let content = try await bridge.readSelection(operation)
+        guard !Task.isCancelled,
+          isCurrentClipboardBridge(identity: bridgeIdentity, generation: generation)
+        else { return }
+        try applyClipboardContent(content, explicit: true)
+      } catch {
+        guard !Task.isCancelled,
+          isCurrentClipboardBridge(identity: bridgeIdentity, generation: generation)
+        else { return }
+        presentClipboardFailure(
+          error,
+          action: operation == .copy ? "Copy from Android" : "Cut from Android"
+        )
+      }
+    }
+    NSApp.mainMenu?.update()
+  }
+
+  private var clipboardBridgeForAction: (any DeviceClipboardBridge)? {
+    guard assignment.isSelectedDeviceConnected,
+      !assignment.isTransitioning,
+      !isPreparingDeviceSwitch,
+      !isPreparingToClose,
+      let bridge = source?.clipboardBridge,
+      bridge.clipboardState.isAvailable
+    else { return nil }
+    return bridge
+  }
+
+  private func isCurrentClipboardBridge(identity: ObjectIdentifier, generation: Int) -> Bool {
+    guard clipboardGeneration == generation, let bridge = source?.clipboardBridge else {
+      return false
+    }
+    return ObjectIdentifier(bridge) == identity
+  }
+
+  private func finishClipboardTask(generation: Int) {
+    guard clipboardGeneration == generation else { return }
+    clipboardTask = nil
+    NSApp.mainMenu?.update()
   }
 
   @objc func captureImage(_ sender: Any?) {
@@ -1039,6 +1213,14 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
   }
 
   func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+    if menuItem.action == #selector(copyFromAndroid(_:))
+      || menuItem.action == #selector(cutFromAndroid(_:))
+    {
+      return clipboardTask == nil && clipboardBridgeForAction != nil
+    }
+    if menuItem.action == #selector(pasteToAndroid(_:)) {
+      return clipboardTask == nil && clipboardBridgeForAction != nil && pasteboard.plainText != nil
+    }
     if menuItem.action == #selector(toggleRecording(_:)) {
       if recordingFinishTask != nil {
         menuItem.title = "Finishing…"
@@ -1115,6 +1297,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
     recordingTimerTask?.cancel()
     recordingStatusDismissTask?.cancel()
     let remainingSource = source
+    invalidateClipboardBinding()
     source = nil
     sourceDeviceID = nil
     resetQualityStateForNoSource()
@@ -1408,6 +1591,17 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, NSMenu
       return
     }
     let alert = NSAlert(error: error)
+    alert.beginSheetModal(for: window)
+  }
+
+  private func presentClipboardFailure(_ error: Error, action: String) {
+    guard let window, !isPreparingToClose else { return }
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "\(action) failed"
+    alert.informativeText =
+      "\(error.localizedDescription)\n\nControl-C, Control-X, and Control-V still send raw Android shortcuts when an app needs keyboard-specific behavior."
+    alert.addButton(withTitle: "OK")
     alert.beginSheetModal(for: window)
   }
 

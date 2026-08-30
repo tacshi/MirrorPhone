@@ -92,6 +92,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     captureItem.target = nil
     fileMenuItem.submenu = fileMenu
 
+    let editMenuItem = NSMenuItem()
+    mainMenu.addItem(editMenuItem)
+    let editMenu = NSMenu(title: "Edit")
+    let cutItem = editMenu.addItem(
+      withTitle: "Cut", action: #selector(MirrorWindowController.cutFromAndroid(_:)),
+      keyEquivalent: "x")
+    cutItem.target = nil
+    let copyItem = editMenu.addItem(
+      withTitle: "Copy", action: #selector(MirrorWindowController.copyFromAndroid(_:)),
+      keyEquivalent: "c")
+    copyItem.target = nil
+    let pasteItem = editMenu.addItem(
+      withTitle: "Paste", action: #selector(MirrorWindowController.pasteToAndroid(_:)),
+      keyEquivalent: "v")
+    pasteItem.target = nil
+    editMenuItem.submenu = editMenu
+
     let viewMenuItem = NSMenuItem()
     mainMenu.addItem(viewMenuItem)
     let viewMenu = NSMenu(title: "View")

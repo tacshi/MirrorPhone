@@ -357,7 +357,7 @@ final class AndroidADBDeviceMonitor: @unchecked Sendable {
 
 @MainActor
 final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
-  QualityAdjustableMirrorSource
+  DeviceClipboardBridge, QualityAdjustableMirrorSource
 {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
@@ -374,6 +374,11 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
   /// Fired when the input injector dies unexpectedly, so the UI can abandon any
   /// in-flight gesture instead of continuing it against a fresh server.
   var onInputInterrupted: (() -> Void)?
+  private(set) var clipboardState = DeviceClipboardState.unavailable(
+    "Android clipboard bridge is not connected."
+  )
+  var onClipboardStateChanged: ((DeviceClipboardState) -> Void)?
+  var onClipboardContentChanged: ((DeviceClipboardContent) -> Void)?
 
   private let serial: String
   private let deviceName: String
@@ -387,6 +392,37 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
   }
 
   var inputSink: DeviceInputSink? { self }
+  var clipboardBridge: DeviceClipboardBridge? { self }
+
+  func readSelection(
+    _ operation: DeviceClipboardSelectionOperation
+  ) async throws -> DeviceClipboardContent {
+    guard let inputRunner, clipboardState.isAvailable else {
+      throw DeviceClipboardError.unavailable(clipboardState.limitation)
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      inputRunner.readClipboard(operation) { result in
+        switch result {
+        case .success(let content): continuation.resume(returning: content)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      }
+    }
+  }
+
+  func paste(_ text: String) async throws {
+    guard let inputRunner, clipboardState.isAvailable else {
+      throw DeviceClipboardError.unavailable(clipboardState.limitation)
+    }
+    try await withCheckedThrowingContinuation { continuation in
+      inputRunner.pasteClipboard(text) { result in
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      }
+    }
+  }
 
   func setQualityMode(_ mode: MirrorQualityMode) {
     guard let level = qualityController.setMode(mode) else { return }
@@ -528,10 +564,22 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
         Task { @MainActor [weak self] in
           self?.onInputInterrupted?()
         }
+      },
+      onClipboardState: { [weak self] state in
+        Task { @MainActor [weak self] in
+          guard let self else { return }
+          clipboardState = state
+          onClipboardStateChanged?(state)
+        }
+      },
+      onClipboardContent: { [weak self] content in
+        Task { @MainActor [weak self] in
+          self?.onClipboardContentChanged?(content)
+        }
       }
     )
-    inputRunner.start()
     self.inputRunner = inputRunner
+    inputRunner.start()
 
     onStatus?("Connected to \(deviceName) by USB · waiting for video")
   }
@@ -543,6 +591,8 @@ final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink,
     audioRunner = nil
     inputRunner?.stop()
     inputRunner = nil
+    clipboardState = .unavailable("The Android device is disconnected.")
+    onClipboardStateChanged?(clipboardState)
     await runner?.stop()
   }
 }

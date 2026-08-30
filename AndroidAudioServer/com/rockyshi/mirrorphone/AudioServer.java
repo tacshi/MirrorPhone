@@ -1,9 +1,6 @@
 package com.rockyshi.mirrorphone;
 
-import android.content.AttributionSource;
 import android.content.Context;
-import android.content.ContextWrapper;
-import android.content.pm.ApplicationInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -11,14 +8,11 @@ import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Looper;
-import android.os.Process;
 import android.util.Log;
 
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 /**
@@ -41,7 +35,6 @@ public final class AudioServer {
   private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_STEREO;
   private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
   private static final int BYTES_PER_FRAME = 4; // 2 channels * 16-bit
-  private static final String SHELL_PACKAGE = "com.android.shell";
   // Diagnostics go to logcat: `adb exec-out` merges the remote stderr into the
   // stream the Mac plays, so nothing but PCM may be written to either fd.
   private static final String TAG = "mirrorphone-audio";
@@ -163,7 +156,7 @@ public final class AudioServer {
     mixBuilderClass.getMethod("setRouteFlags", int.class).invoke(mixBuilder, ROUTE_FLAG_LOOP_BACK);
     Object mix = mixBuilderClass.getMethod("build").invoke(mixBuilder);
 
-    Context context = shellContext();
+    Context context = ShellContext.create();
     Class<?> policyClass = Class.forName("android.media.audiopolicy.AudioPolicy");
     Class<?> policyBuilderClass = Class.forName("android.media.audiopolicy.AudioPolicy$Builder");
     Object policyBuilder = policyBuilderClass.getConstructor(Context.class).newInstance(context);
@@ -211,82 +204,4 @@ public final class AudioServer {
     }
   }
 
-  /**
-   * A Context that attributes audio requests to the shell user, whose uid this
-   * process runs as and which holds MODIFY_AUDIO_ROUTING and RECORD_AUDIO.
-   *
-   * <p>The hidden AudioRecord constructor used by {@code createAudioRecordSink}
-   * takes its attribution from the process-wide ActivityThread, not from the
-   * policy's context, so a fake ActivityThread bound to the shell package is
-   * installed first (scrcpy's Workarounds approach). Without it the attribution
-   * is {uid 2000, package "android"}, which AudioFlinger rejects as invalid.
-   */
-  private static Context shellContext() throws Exception {
-    Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-    Constructor<?> activityThreadConstructor = activityThreadClass.getDeclaredConstructor();
-    activityThreadConstructor.setAccessible(true);
-    Object activityThread = activityThreadConstructor.newInstance();
-
-    Field currentThreadField = activityThreadClass.getDeclaredField("sCurrentActivityThread");
-    currentThreadField.setAccessible(true);
-    currentThreadField.set(null, activityThread);
-
-    Field systemThreadField = activityThreadClass.getDeclaredField("mSystemThread");
-    systemThreadField.setAccessible(true);
-    systemThreadField.setBoolean(activityThread, true);
-
-    Class<?> appBindDataClass = Class.forName("android.app.ActivityThread$AppBindData");
-    Constructor<?> appBindDataConstructor = appBindDataClass.getDeclaredConstructor();
-    appBindDataConstructor.setAccessible(true);
-    Object appBindData = appBindDataConstructor.newInstance();
-    ApplicationInfo applicationInfo = new ApplicationInfo();
-    applicationInfo.packageName = SHELL_PACKAGE;
-    Field appInfoField = appBindDataClass.getDeclaredField("appInfo");
-    appInfoField.setAccessible(true);
-    appInfoField.set(appBindData, applicationInfo);
-    Field boundApplicationField = activityThreadClass.getDeclaredField("mBoundApplication");
-    boundApplicationField.setAccessible(true);
-    boundApplicationField.set(activityThread, appBindData);
-
-    // Some OEM framework paths (e.g. Samsung's CompatSandbox) call
-    // ActivityThread.getConfiguration() while creating the system context and
-    // crash if mConfigurationController is unset. Best-effort.
-    try {
-      Class<?> configurationControllerClass = Class.forName("android.app.ConfigurationController");
-      Class<?> activityThreadInternalClass = Class.forName("android.app.ActivityThreadInternal");
-      Constructor<?> configurationControllerConstructor =
-          configurationControllerClass.getDeclaredConstructor(activityThreadInternalClass);
-      configurationControllerConstructor.setAccessible(true);
-      Object configurationController = configurationControllerConstructor.newInstance(activityThread);
-      Field configurationControllerField =
-          activityThreadClass.getDeclaredField("mConfigurationController");
-      configurationControllerField.setAccessible(true);
-      configurationControllerField.set(activityThread, configurationController);
-    } catch (Throwable ignored) {
-    }
-
-    Context system = (Context) activityThreadClass.getMethod("getSystemContext").invoke(activityThread);
-    return new ContextWrapper(system) {
-      @Override
-      public String getOpPackageName() {
-        return SHELL_PACKAGE;
-      }
-
-      @Override
-      public AttributionSource getAttributionSource() {
-        AttributionSource.Builder builder =
-            new AttributionSource.Builder(Process.SHELL_UID).setPackageName(SHELL_PACKAGE);
-        // Android 15+ verifies the pid in the attribution; without it,
-        // AudioFlinger refuses to create the record track (status -1).
-        // setPid is not in the public SDK on every level, hence reflection.
-        try {
-          AttributionSource.Builder.class
-              .getMethod("setPid", int.class)
-              .invoke(builder, Process.myPid());
-        } catch (ReflectiveOperationException ignored) {
-        }
-        return builder.build();
-      }
-    };
-  }
 }
