@@ -3,9 +3,9 @@ import CoreMediaIO
 import Foundation
 
 @MainActor
-final class DeviceDiscovery {
+final class DeviceDiscovery: MirrorDeviceDiscovering {
   var onDevicesChanged: (([MirrorDevice]) -> Void)?
-  var onIOSCaptureDeviceReady: (() -> Void)?
+  var onIOSCaptureDeviceReady: ((Set<String>) -> Void)?
 
   private var iosDevices = [MirrorDevice]()
   private var androidDevices = [MirrorDevice]()
@@ -20,7 +20,7 @@ final class DeviceDiscovery {
   private var isIOSUSBPhysicallyAttached = false
   private var iosDetachTask: Task<Void, Never>?
   private var needsIOSCaptureRestart = false
-  private var isIOSCaptureLive = false
+  private var liveIOSCaptureDeviceIDs = Set<String>()
   private var isStarted = false
 
   func start() {
@@ -39,9 +39,19 @@ final class DeviceDiscovery {
         ) { [weak self] notification in
           let captureDeviceRepublished =
             notification.name == AVCaptureDevice.wasConnectedNotification
+          let deviceID = (notification.object as? AVCaptureDevice).map {
+            "avfoundation:\($0.uniqueID)"
+          }
           Task { @MainActor [weak self] in
+            if !captureDeviceRepublished {
+              self?.needsIOSCaptureRestart = true
+              if let deviceID {
+                self?.liveIOSCaptureDeviceIDs.remove(deviceID)
+              }
+            }
             self?.refreshIOSDevices(
-              captureDeviceRepublished: captureDeviceRepublished
+              captureDeviceRepublished: captureDeviceRepublished,
+              republishedDeviceID: captureDeviceRepublished ? deviceID : nil
             )
           }
         }
@@ -82,12 +92,15 @@ final class DeviceDiscovery {
     iosUSBMonitor = nil
     connectedIOSUSBDevices.removeAll()
     isIOSUSBPhysicallyAttached = false
-    isIOSCaptureLive = false
+    liveIOSCaptureDeviceIDs.removeAll()
     androidADBMonitor?.stop()
     androidADBMonitor = nil
   }
 
-  private func refreshIOSDevices(captureDeviceRepublished: Bool = false) {
+  private func refreshIOSDevices(
+    captureDeviceRepublished: Bool = false,
+    republishedDeviceID: String? = nil
+  ) {
     guard isStarted else { return }
     guard !connectedIOSUSBDevices.isEmpty else {
       iosDevices = []
@@ -115,7 +128,12 @@ final class DeviceDiscovery {
     publishDevices()
     if captureDeviceRepublished, needsIOSCaptureRestart, isIOSUSBPhysicallyAttached {
       needsIOSCaptureRestart = false
-      onIOSCaptureDeviceReady?()
+      let discoveredIDs = Set(discoveredDevices.map(\.id))
+      if let republishedDeviceID, discoveredIDs.contains(republishedDeviceID) {
+        onIOSCaptureDeviceReady?([republishedDeviceID])
+      } else {
+        onIOSCaptureDeviceReady?(discoveredIDs)
+      }
     }
   }
 
@@ -126,7 +144,7 @@ final class DeviceDiscovery {
     if !devices.isEmpty {
       if !isIOSUSBPhysicallyAttached {
         needsIOSCaptureRestart = true
-        isIOSCaptureLive = false
+        liveIOSCaptureDeviceIDs.removeAll()
       }
       isIOSUSBPhysicallyAttached = true
       connectedIOSUSBDevices = devices
@@ -134,9 +152,9 @@ final class DeviceDiscovery {
       return
     }
 
-    let wasLive = isIOSCaptureLive
+    let wasLive = !liveIOSCaptureDeviceIDs.isEmpty
     isIOSUSBPhysicallyAttached = false
-    isIOSCaptureLive = false
+    liveIOSCaptureDeviceIDs.removeAll()
     needsIOSCaptureRestart = true
 
     if wasLive {
@@ -161,11 +179,11 @@ final class DeviceDiscovery {
     }
   }
 
-  func markIOSCaptureLive() {
+  func markIOSCaptureLive(deviceID: String) {
     guard isStarted, isIOSUSBPhysicallyAttached else { return }
     iosDetachTask?.cancel()
     iosDetachTask = nil
-    isIOSCaptureLive = true
+    liveIOSCaptureDeviceIDs.insert(deviceID)
   }
 
   private func handleAndroidADBDevicesChanged(_ devices: [AndroidADBDevice]) {
@@ -243,16 +261,4 @@ final class DeviceDiscovery {
       &allowed
     )
   }()
-}
-
-extension MirrorDevice {
-  @MainActor
-  func makeSource() -> any MirrorSource {
-    switch kind {
-    case .iosScreen(let uniqueID):
-      AVCaptureMirrorSource(uniqueID: uniqueID)
-    case .androidADB(let serial):
-      AndroidADBMirrorSource(serial: serial, deviceName: name)
-    }
-  }
 }
