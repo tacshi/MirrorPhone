@@ -1,4 +1,6 @@
 import CoreGraphics
+import CoreImage
+import CoreMedia
 import Foundation
 import ImageIO
 
@@ -299,9 +301,10 @@ final class AndroidADBDeviceMonitor: @unchecked Sendable {
 }
 
 @MainActor
-final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
+final class AndroidADBMirrorSource: RecordableMirrorSource, DeviceInputSink {
   var onFrame: ((CGImage) -> Void)?
   var onStatus: ((String) -> Void)?
+  nonisolated let recordingTap = MirrorRecordingTap()
   /// Fired when the input injector dies unexpectedly, so the UI can abandon any
   /// in-flight gesture instead of continuing it against a fresh server.
   var onInputInterrupted: (() -> Void)?
@@ -359,12 +362,16 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
         self?.onStatus?(status)
       }
     }
+    let videoSampleHandler: @Sendable (MirrorVideoSample) -> Void = { [recordingTap] sample in
+      recordingTap.emit(video: sample)
+    }
     let runner: any AndroidVideoRunner =
       if AndroidVideoCompatibility.requiresFramebufferPolling(deviceName: deviceName) {
         AndroidFramebufferRunner(
           adbURL: adbURL,
           serial: serial,
           onFrame: frameHandler,
+          onVideoSample: videoSampleHandler,
           onStatus: statusHandler
         )
       } else {
@@ -372,6 +379,7 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
           adbURL: adbURL,
           serial: serial,
           onFrame: frameHandler,
+          onVideoSample: videoSampleHandler,
           onStatus: statusHandler
         )
       }
@@ -384,6 +392,7 @@ final class AndroidADBMirrorSource: MirrorSource, DeviceInputSink {
     let audioRunner = AndroidAudioRunner(
       adbURL: adbURL,
       serial: serial,
+      recordingTap: recordingTap,
       onStatus: { [weak self] status in
         Task { @MainActor [weak self] in
           self?.onStatus?(status)
@@ -464,12 +473,17 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
     adbURL: URL,
     serial: String,
     onFrame: @escaping FrameHandler,
+    onVideoSample: @escaping H264Decoder.VideoSampleHandler,
     onStatus: @escaping StatusHandler
   ) {
     self.adbURL = adbURL
     self.serial = serial
     self.onStatus = onStatus
-    streamDecoder = AndroidH264StreamDecoder(onFrame: onFrame, onStatus: onStatus)
+    streamDecoder = AndroidH264StreamDecoder(
+      onVideoSample: onVideoSample,
+      onFrame: onFrame,
+      onStatus: onStatus
+    )
   }
 
   func start() throws {
@@ -770,11 +784,13 @@ private final class AndroidScreenrecordRunner: AndroidVideoRunner, @unchecked Se
 
 private final class AndroidFramebufferRunner: AndroidVideoRunner, @unchecked Sendable {
   typealias FrameHandler = @Sendable (CGImage) -> Void
+  typealias VideoSampleHandler = @Sendable (MirrorVideoSample) -> Void
   typealias StatusHandler = @Sendable (String) -> Void
 
   private let adbURL: URL
   private let serial: String
   private let onFrame: FrameHandler
+  private let onVideoSample: VideoSampleHandler
   private let onStatus: StatusHandler
   private let queue = DispatchQueue(
     label: "com.rockyshi.mirrorphone.android-framebuffer",
@@ -791,11 +807,13 @@ private final class AndroidFramebufferRunner: AndroidVideoRunner, @unchecked Sen
     adbURL: URL,
     serial: String,
     onFrame: @escaping FrameHandler,
+    onVideoSample: @escaping VideoSampleHandler,
     onStatus: @escaping StatusHandler
   ) {
     self.adbURL = adbURL
     self.serial = serial
     self.onFrame = onFrame
+    self.onVideoSample = onVideoSample
     self.onStatus = onStatus
   }
 
@@ -859,6 +877,12 @@ private final class AndroidFramebufferRunner: AndroidVideoRunner, @unchecked Sen
           guard let source = CGImageSourceCreateWithData(png as CFData, nil),
             let frame = CGImageSourceCreateImageAtIndex(source, 0, nil)
           else { continue }
+          onVideoSample(
+            MirrorVideoSample(
+              image: CIImage(cgImage: frame),
+              presentationTime: CMClockGetTime(CMClockGetHostTimeClock())
+            )
+          )
           onFrame(frame)
         }
       }
@@ -980,8 +1004,12 @@ private final class AndroidH264StreamDecoder: @unchecked Sendable {
   private var needsConfiguration = true
   private var configured = false
 
-  init(onFrame: @escaping FrameHandler, onStatus: @escaping StatusHandler) {
-    decoder = H264Decoder(onFrame: onFrame)
+  init(
+    onVideoSample: @escaping H264Decoder.VideoSampleHandler,
+    onFrame: @escaping FrameHandler,
+    onStatus: @escaping StatusHandler
+  ) {
+    decoder = H264Decoder(onVideoSample: onVideoSample, onFrame: onFrame)
     self.onStatus = onStatus
   }
 

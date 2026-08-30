@@ -27,7 +27,7 @@
     <key>NSCameraUsageDescription</key>
     <string>MirrorPhone uses video capture access to display the screen of an iPhone or iPad connected by USB.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>MirrorPhone uses audio capture access to play the sound from an iPhone or iPad connected by USB through this Mac.</string>
+    <string>MirrorPhone uses audio capture access to play and record the sound from an iPhone or iPad connected by USB.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

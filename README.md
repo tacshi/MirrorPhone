@@ -26,6 +26,7 @@ iOS and iPadOS do not expose a public system-wide input-injection API comparable
 - iPhone and iPad audio through the USB capture stream
 - Android taps, drags, scrolling, text entry, navigation keys, and keyboard shortcuts
 - Automatic recovery when Android's `screenrecord` session reaches its time limit
+- Native-resolution MP4 screen recording at up to 60 fps with H.264 video and AAC device audio
 - Actual-size display mode and PNG frame capture
 - No iOS companion app or Android APK installation
 
@@ -46,11 +47,11 @@ The video-only iPhone and iPad build does not require the Android SDK.
 Clone the repository, then run:
 
 ```sh
-./build-debug.sh
+./scripts/build-debug.sh
 open MirrorPhone.app
 ```
 
-Despite its name, `build-debug.sh` builds an optimized executable by default because the H.264 decode path must keep pace with high-refresh-rate displays. Set `MIRRORPHONE_BUILD_CONFIGURATION=debug` when a debug build is required.
+Despite its name, `scripts/build-debug.sh` builds an optimized executable by default because the H.264 decode path must keep pace with high-refresh-rate displays. Set `MIRRORPHONE_BUILD_CONFIGURATION=debug` when a debug build is required.
 
 The script packages the app, bundles `adb` from `PATH` or the standard Android SDK location, and builds the Android helpers when the required SDK tools are available. Missing Android helper dependencies do not stop the build; the affected audio or input feature is disabled instead.
 
@@ -77,7 +78,7 @@ swift test
 1. Connect the unlocked device by USB.
 2. Tap **Trust** on the device if prompted.
 3. Allow video access when macOS requests it.
-4. Allow microphone access to hear device audio. Denying it leaves video capture available.
+4. Allow microphone access to hear and record device audio. Denying it leaves video capture and video-only recording available.
 
 The device remains view-only in MirrorPhone.
 
@@ -91,21 +92,30 @@ Click or drag in the mirrored display to send touch input. Mouse-wheel and track
 
 Android audio and input require Android 11 or later. Audio capture depends on Android version and vendor policy; unsupported devices continue mirroring without sound. The phone may be muted while its output is routed to the Mac.
 
+## Record the device screen
+
+Choose **File > Start Recording…**, press <kbd>Command</kbd> + <kbd>R</kbd>, or use the record button beside the image-capture action. Pick the MP4 destination before recording starts, then use the same action to stop.
+
+Recordings contain only the device surface—not the MirrorPhone window, pointer, or recording indicator. Live mirroring stays at the device's native cadence, while recording preserves the source timestamps and cadence up to 60 fps; higher-refresh sources are sampled without slowing the mirror. The frame visible at start defines one fixed, even-sized canvas. If the device rotates, the correctly oriented image is aspect-fit over black bars rather than changing the MP4 dimensions. Android's periodic `screenrecord` refresh continues in the same file.
+
+Device audio is recorded when the source exposes it. Microphone denial on iPhone/iPad, Android versions before 11, vendor restrictions, or an interrupted audio stream never stop the video; the on-screen muted badge identifies a video-only recording. Switching devices, disconnecting, closing the window, or quitting safely finalizes the current file before continuing.
+
 ## Application shortcuts
 
 | Shortcut | Action |
 | --- | --- |
 | <kbd>Command</kbd> + <kbd>0</kbd> | Show the current frame at actual size |
+| <kbd>Command</kbd> + <kbd>R</kbd> | Start or stop an MP4 recording |
 | <kbd>Command</kbd> + <kbd>S</kbd> | Save the current frame as a PNG |
 
 ## Release build
 
-`build-dmg.sh` creates a signed, notarized disk image:
+`scripts/build-dmg.sh` creates a signed, notarized disk image:
 
 ```sh
 DEVELOPER_ID_APPLICATION="Developer ID Application: Your Name (TEAMID)" \
 MIRRORPHONE_NOTARY_PROFILE="YOUR_NOTARYTOOL_PROFILE" \
-./build-dmg.sh 1.0.0
+./scripts/build-dmg.sh 1.0.0
 ```
 
 The signing identity is resolved from `MIRRORPHONE_SIGNING_IDENTITY`, then `DEVELOPER_ID_APPLICATION`. Exporting `DEVELOPER_ID_APPLICATION` from your shell profile leaves only the `notarytool` profile to pass per release. Set `MIRRORPHONE_TEAM_ID` instead to look the identity up in Keychain by team. The finished disk image is written to `dist/`.
@@ -113,7 +123,7 @@ The signing identity is resolved from `MIRRORPHONE_SIGNING_IDENTITY`, then `DEVE
 To build the disk image and upload it with a SHA-256 checksum to a draft GitHub Release, run:
 
 ```sh
-./release.sh 1.0.0
+./scripts/release.sh 1.0.0
 ```
 
 The release script requires a clean branch that exactly matches its remote upstream and an authenticated GitHub CLI. Select the Developer ID identity with `DEVELOPER_ID_APPLICATION` (or `MIRRORPHONE_TEAM_ID`) and the `notarytool` Keychain profile with `MIRRORPHONE_NOTARY_PROFILE`; the script does not accept or store signing credentials. Review the draft release before publishing it.

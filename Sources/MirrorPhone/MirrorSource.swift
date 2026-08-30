@@ -118,6 +118,11 @@ extension MirrorSource {
 }
 
 @MainActor
+protocol RecordableMirrorSource: MirrorSource {
+  var recordingTap: MirrorRecordingTap { get }
+}
+
+@MainActor
 protocol DeviceDetectingMirrorSource: MirrorSource {
   var onDeviceDetected: ((String) -> Void)? { get set }
 }

@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-ROOT="${0:A:h}"
+SCRIPT_DIR="${0:A:h}"
+ROOT="${SCRIPT_DIR:h}"
 # Release by default: the H.264 parse/decode path must outrun 120 Hz phone
 # displays, and debug-mode Swift is several times slower there.
 CONFIGURATION="${MIRRORPHONE_BUILD_CONFIGURATION:-release}"
@@ -43,7 +44,7 @@ else
   echo "warning: adb was not found; the packaged app will support iPhone/iPad only" >&2
 fi
 
-AUDIO_JAR="$("$ROOT/build-android-audio-server.sh" | tail -n1 || true)"
+AUDIO_JAR="$("$SCRIPT_DIR/build-android-audio-server.sh" | tail -n1 || true)"
 if [[ -n "$AUDIO_JAR" && -f "$AUDIO_JAR" ]]; then
   # The dex jar is device-side data pushed over adb, never executed on the Mac,
   # so it lives in Resources. codesign treats anything outside Contents/Resources
@@ -53,7 +54,7 @@ else
   echo "warning: Android audio server was not built; Android mirroring will be video-only" >&2
 fi
 
-INPUT_JAR="$("$ROOT/build-android-input-server.sh" | tail -n1 || true)"
+INPUT_JAR="$("$SCRIPT_DIR/build-android-input-server.sh" | tail -n1 || true)"
 if [[ -n "$INPUT_JAR" && -f "$INPUT_JAR" ]]; then
   # Device-side data pushed over adb, never executed on the Mac; lives in
   # Resources so codesign does not treat it as nested code.
